@@ -16,7 +16,7 @@ jobs:
           username: ${{ secrets.DROPLET_USER }}
           key: ${{ secrets.DROPLET_SSH_KEY }}
           script: |
-            cd /root/nelhealthcoach-agent
+            cd /root/nhc-cm-agent
             git pull origin main
             .venv/bin/pip install -r requirements.txt
             systemctl restart nel-agent
