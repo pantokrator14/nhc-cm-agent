@@ -58,6 +58,7 @@ from drive_service import (
     load_scheduled_sessions,
     mark_comment_processed,
     mark_drive_file_published,
+    mark_entry_published_in_monthly_doc,
     mark_file_state,
     mark_guideline_header_published,
     parse_guidelines_entries,
@@ -133,6 +134,7 @@ class ProposalSession:
     revision_history: list[str] = field(default_factory=list)
     is_existing_guideline: bool = False
     existing_doc_header: str = ""
+    doc_header: str = ""
     technical_note: str = ""
     location_label: str = ""
     admin_messages: dict[int, int] = field(default_factory=dict)
@@ -464,6 +466,7 @@ class NelHealthCoachBot:
             "status": session.status,
             "is_existing_guideline": session.is_existing_guideline,
             "existing_doc_header": session.existing_doc_header,
+            "doc_header": session.doc_header,
             "technical_note": session.technical_note,
             "location_label": session.location_label,
         }
@@ -502,6 +505,7 @@ class NelHealthCoachBot:
                     status="scheduled",
                     is_existing_guideline=bool(payload.get("is_existing_guideline", False)),
                     existing_doc_header=str(payload.get("existing_doc_header", "")),
+                    doc_header=str(payload.get("doc_header", "")),
                     technical_note=str(payload.get("technical_note", "")),
                     location_label=str(payload.get("location_label", "")),
                 )
@@ -1218,6 +1222,8 @@ class NelHealthCoachBot:
                     scheduled_dt,
                 )
                 session.file_metadata["name"] = final_name
+                if doc_header:
+                    session.doc_header = doc_header
             except Exception as sync_exc:
                 logger.exception(
                     "Error al actualizar Pautas / Drive para '%s': %s",
@@ -1718,14 +1724,29 @@ class NelHealthCoachBot:
                 },
                 self.settings.state_file_path,
             )
-            if session.is_existing_guideline and session.existing_doc_header:
+            header_to_mark = session.doc_header or session.existing_doc_header
+            if header_to_mark:
                 await asyncio.to_thread(
                     mark_guideline_header_published,
-                    session.existing_doc_header,
+                    header_to_mark,
                     session.month_folder_id,
                     file_id,
                     self.settings.state_file_path,
                 )
+                if session.month_folder_id:
+                    try:
+                        await asyncio.to_thread(
+                            mark_entry_published_in_monthly_doc,
+                            session.month_folder_id,
+                            header_to_mark,
+                            self.settings.google_application_credentials,
+                        )
+                    except Exception as doc_mark_exc:
+                        logger.warning(
+                            "Publicación exitosa en IG, pero no se pudo marcar [PUBLICADO] en Pautas (%s): %s",
+                            header_to_mark,
+                            doc_mark_exc,
+                        )
             await asyncio.to_thread(
                 remove_scheduled_session,
                 proposal_id,
@@ -2089,6 +2110,20 @@ class NelHealthCoachBot:
                 str(item.drive_file["id"]) if item.drive_file else "",
                 self.settings.state_file_path,
             )
+            if self.cached_pautas_month_folder_id:
+                try:
+                    await asyncio.to_thread(
+                        mark_entry_published_in_monthly_doc,
+                        self.cached_pautas_month_folder_id,
+                        entry.header,
+                        self.settings.google_application_credentials,
+                    )
+                except Exception as doc_mark_exc:
+                    logger.warning(
+                        "No se pudo escribir [PUBLICADO] en Google Docs para '%s': %s",
+                        entry.header,
+                        doc_mark_exc,
+                    )
             if item.drive_file is not None:
                 fid = str(item.drive_file["id"])
                 fname = str(item.drive_file.get("name", entry.header))

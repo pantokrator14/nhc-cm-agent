@@ -1543,6 +1543,7 @@ class GuidelineEntry:
     keyword: str
     target_link: str
     raw_block: str
+    is_marked_published: bool = False
 
 
 @dataclass(slots=True)
@@ -1567,16 +1568,23 @@ _ENTRY_BOLD_PREFIXES = (
 )
 
 
+_PUBLISHED_HEADER_TAG_RE = re.compile(r"\s*\[(?:PUBLICADO|PUBLISHED)\]\s*", re.IGNORECASE)
+
+
+def _strip_published_marker(text: str) -> str:
+    return _PUBLISHED_HEADER_TAG_RE.sub(" ", text).strip()
+
+
 def _match_entry_header(line: str) -> tuple[Literal["MAIN", "PRO_TIP"], str] | None:
     stripped = line.strip()
     if not stripped:
         return None
     m_protip = re.match(r"^Pro\s*Tip\s+\d+\s*:\s*(.+)$", stripped, flags=re.IGNORECASE)
     if m_protip:
-        return "PRO_TIP", m_protip.group(1).strip()
+        return "PRO_TIP", _strip_published_marker(m_protip.group(1).strip())
     m_main = re.match(r"^\d+\.\s+(.+)$", stripped)
     if m_main:
-        title = m_main.group(1).strip()
+        title = _strip_published_marker(m_main.group(1).strip())
         if title.lower().startswith("título"):
             return None
         return "MAIN", title
@@ -1743,6 +1751,7 @@ def parse_guidelines_entries(
                 keyword=keyword,
                 target_link=target_link,
                 raw_block="\n".join(block_lines).strip(),
+                is_marked_published=bool(_PUBLISHED_HEADER_TAG_RE.search(header)),
             )
         )
 
@@ -1796,25 +1805,57 @@ def _entry_matches_ig_post(
     entry: GuidelineEntry,
     ig_media_list: list[dict[str, Any]],
 ) -> bool:
+    """Cross-check whether `entry` was already published using ONLY caption + hashtags (never hook_title)."""
     if not ig_media_list:
         return False
 
     caption_norm = _normalize_match_text(entry.caption)
-    hook_norm = _normalize_match_text(entry.hook_title)
-    probe = caption_norm[:80].strip() if len(caption_norm) >= 25 else hook_norm
-    probe_words = set(re.findall(r"[a-z0-9]{4,}", caption_norm or hook_norm))
+    caption_probe = caption_norm[:80].strip() if len(caption_norm) >= 20 else ""
+    cap_words = set(re.findall(r"[a-z0-9]{4,}", caption_norm))
+    entry_tags = {
+        tag.lower()
+        for tag in re.findall(r"#[\wáéíóúüñÁÉÍÓÚÜÑ]+", f"{entry.hashtags} {entry.caption}")
+    }
+
+    if not caption_norm and not entry_tags:
+        return False
 
     for media in ig_media_list:
-        ig_cap = _normalize_match_text(str(media.get("caption", "")))
+        ig_raw = str(media.get("caption", ""))
+        ig_cap = _normalize_match_text(ig_raw)
         if not ig_cap:
             continue
-        if probe and len(probe) >= 18 and probe in ig_cap:
+
+        # 1. Exact or prefix normalized caption match
+        if caption_probe and caption_probe in ig_cap:
             return True
-        if probe_words and len(probe_words) >= 4:
-            ig_words = set(re.findall(r"[a-z0-9]{4,}", ig_cap))
-            overlap = len(probe_words & ig_words) / len(probe_words)
-            if overlap >= 0.65:
-                return True
+        if 10 <= len(caption_norm) < 20 and caption_norm in ig_cap:
+            return True
+
+        ig_words = set(re.findall(r"[a-z0-9]{4,}", ig_cap))
+        cap_overlap = (
+            (len(cap_words & ig_words) / len(cap_words))
+            if cap_words
+            else 0.0
+        )
+
+        # 2. High caption word overlap
+        if len(cap_words) >= 4 and cap_overlap >= 0.60:
+            return True
+
+        # 3. Hashtags + caption cross-check
+        if entry_tags:
+            ig_tags = {
+                tag.lower()
+                for tag in re.findall(r"#[\wáéíóúüñÁÉÍÓÚÜÑ]+", ig_raw)
+            }
+            shared_tags = len(entry_tags & ig_tags)
+            if shared_tags >= min(len(entry_tags), 3) and shared_tags >= 2:
+                if not cap_words or cap_overlap >= 0.30:
+                    return True
+            if len(entry_tags) >= 5 and entry_tags.issubset(ig_tags):
+                if not cap_words or bool(cap_words & ig_words):
+                    return True
     return False
 
 
@@ -1831,6 +1872,9 @@ def find_unpublished_guidelines(
     state = load_state(state_path)
     recorded_files: dict[str, Any] = state["files"]
     published_headers: dict[str, Any] = state.get("published_guideline_headers", {})
+    published_headers_clean = {
+        _normalize_match_text(_strip_published_marker(k)) for k in published_headers
+    }
     active_ids = active_scheduler_file_ids or set()
     ig_posts = recent_ig_media or []
 
@@ -1838,8 +1882,11 @@ def find_unpublished_guidelines(
     unpublished: list[UnpublishedGuidelineItem] = []
 
     for entry in entries:
-        header_key = _normalize_match_text(entry.header)
-        if header_key in published_headers:
+        if entry.is_marked_published:
+            continue
+
+        header_key = _normalize_match_text(_strip_published_marker(entry.header))
+        if header_key in published_headers_clean or _normalize_match_text(entry.header) in published_headers:
             continue
 
         drive_file = _match_entry_to_drive_file(entry, month_files, recorded_files)
@@ -1853,7 +1900,11 @@ def find_unpublished_guidelines(
             local_status = str(rec.get("status", "IN_DRIVE")).upper()
             drive_app_status = str((drive_file.get("appProperties") or {}).get("status", "")).lower()
 
-            if local_status in {"PUBLISHED", "DISCARDED"} or drive_app_status == "published":
+            if (
+                local_status in {"PUBLISHED", "DISCARDED"}
+                or drive_app_status == "published"
+                or bool(_PUBLISHED_HEADER_TAG_RE.search(str(drive_file.get("name", ""))))
+            ):
                 continue
 
         if _entry_matches_ig_post(entry, ig_posts):
@@ -2044,6 +2095,138 @@ def update_entry_in_monthly_doc(
     except HttpError as drive_exc:
         raise DriveServiceError(
             f"Error al actualizar '{target_header}' en Google Doc {doc_id}: {drive_exc}"
+        ) from drive_exc
+
+
+def mark_entry_published_in_monthly_doc(
+    month_folder_id: str,
+    target_header: str,
+    credentials_path: Path | str | None = None,
+) -> str:
+    """Append ` [PUBLICADO]` to the target entry header inside the monthly `Pautas` Google Doc."""
+    clean_target = _strip_published_marker(target_header)
+    if not clean_target or not month_folder_id:
+        return "skipped"
+
+    doc_meta = get_monthly_doc_metadata(month_folder_id, credentials_path=credentials_path)
+    if not doc_meta:
+        return "no_doc"
+
+    doc_id = str(doc_meta["id"])
+    norm_target = _normalize_match_text(clean_target)
+
+    try:
+        docs_service = _get_docs_client(credentials_path)
+        doc = _execute_with_retry(
+            docs_service.documents().get(documentId=doc_id),
+            f"docs_get_for_mark_pub({doc_id})",
+        )
+        content = doc.get("body", {}).get("content", [])
+
+        paragraphs: list[tuple[int, int, str]] = []
+        for elem in content:
+            para = elem.get("paragraph")
+            if not para:
+                continue
+            start_i = int(elem.get("startIndex", 0))
+            end_i = int(elem.get("endIndex", 0))
+            raw_text = "".join(
+                el.get("textRun", {}).get("content", "")
+                for el in para.get("elements", [])
+            )
+            paragraphs.append((start_i, end_i, raw_text))
+
+        search_from = 0
+        for idx, (_, _, raw_t) in enumerate(paragraphs):
+            if re.match(r"^===\s*PAUTAS DEL MES\b", raw_t.strip(), re.IGNORECASE):
+                search_from = idx + 1
+                break
+
+        found_para: tuple[int, int, str] | None = None
+        for para_info in paragraphs[search_from:]:
+            stripped = para_info[2].strip()
+            if _normalize_match_text(_strip_published_marker(stripped)) == norm_target:
+                found_para = para_info
+                break
+
+        if found_para is None:
+            logger.debug("No se encontró '%s' en Doc %s para marcar [PUBLICADO].", clean_target, doc_id)
+            return "not_found"
+
+        start_i, end_i, raw_t = found_para
+        if _PUBLISHED_HEADER_TAG_RE.search(raw_t):
+            return "already_marked"
+
+        insert_index = max(start_i, end_i - 1)
+        _execute_with_retry(
+            docs_service.documents().batchUpdate(
+                documentId=doc_id,
+                body={
+                    "requests": [
+                        {
+                            "insertText": {
+                                "location": {"index": insert_index},
+                                "text": " [PUBLICADO]",
+                            }
+                        }
+                    ]
+                },
+            ),
+            f"docs_mark_published({doc_id})",
+        )
+        logger.info("Encabezado '%s [PUBLICADO]' marcado en Google Doc %s.", clean_target, doc_id)
+        return "docs_api"
+    except HttpError as docs_exc:
+        if docs_exc.resp.status not in {403, 404}:
+            raise DriveServiceError(
+                f"Error marcando [PUBLICADO] en Doc {doc_id} para '{clean_target}': {docs_exc}"
+            ) from docs_exc
+
+    try:
+        drive_service = _get_drive_client(credentials_path)
+        html_bytes: bytes = _execute_with_retry(
+            drive_service.files().export(fileId=doc_id, mimeType="text/html"),
+            f"export_html_mark_pub({doc_id})",
+        )
+        current_html = html_bytes.decode("utf-8")
+        p_matches = list(re.finditer(r"(<p\b[^>]*>)(.*?)(</p>)", current_html, flags=re.DOTALL | re.IGNORECASE))
+        search_from = 0
+        for idx, m in enumerate(p_matches):
+            ptext = html_lib.unescape(re.sub(r"<[^>]+>", "", m.group(2))).strip()
+            if re.match(r"^===\s*PAUTAS DEL MES\b", ptext, re.IGNORECASE):
+                search_from = idx + 1
+                break
+
+        target_match = None
+        for m in p_matches[search_from:]:
+            ptext = html_lib.unescape(re.sub(r"<[^>]+>", "", m.group(2))).strip()
+            if _normalize_match_text(_strip_published_marker(ptext)) == norm_target:
+                target_match = m
+                break
+
+        if target_match is None:
+            return "not_found"
+        plain_hit = html_lib.unescape(re.sub(r"<[^>]+>", "", target_match.group(2))).strip()
+        if _PUBLISHED_HEADER_TAG_RE.search(plain_hit):
+            return "already_marked"
+
+        insert_pos = target_match.end(2)
+        updated_html = current_html[:insert_pos] + " [PUBLICADO]" + current_html[insert_pos:]
+        media = MediaInMemoryUpload(updated_html.encode("utf-8"), mimetype="text/html", resumable=False)
+        _execute_with_retry(
+            drive_service.files().update(
+                fileId=doc_id,
+                media_body=media,
+                fields="id, name",
+                supportsAllDrives=True,
+            ),
+            f"drive_html_mark_pub({doc_id})",
+        )
+        logger.info("Encabezado '%s [PUBLICADO]' marcado vía respaldo HTML en Doc %s.", clean_target, doc_id)
+        return "drive_html_fallback"
+    except HttpError as drive_exc:
+        raise DriveServiceError(
+            f"Error marcando [PUBLICADO] en Doc {doc_id} vía Drive HTML: {drive_exc}"
         ) from drive_exc
 
 
