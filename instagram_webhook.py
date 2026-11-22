@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
@@ -13,6 +14,7 @@ from fastapi.responses import PlainTextResponse
 
 from config import Settings
 from drive_service import (
+    get_effective_meta_token,
     get_published_media,
     is_comment_processed,
     mark_comment_processed,
@@ -92,6 +94,8 @@ async def _process_comment_event(
     media_id: str,
     comment_text: str,
     username: str,
+    from_id: str = "",
+    interaction_callback: Callable[..., Awaitable[None]] | None = None,
 ) -> None:
     try:
         already_processed = await asyncio.to_thread(
@@ -103,26 +107,35 @@ async def _process_comment_event(
             logger.debug("comment_id=%s ya fue procesado; se omite duplicado.", comment_id)
             return
 
+        active_token = await asyncio.to_thread(
+            get_effective_meta_token,
+            settings.meta_access_token,
+            settings.state_file_path,
+        )
+
         media_record = await asyncio.to_thread(
             get_published_media,
             media_id,
             settings.state_file_path,
         )
-        if not media_record:
-            logger.debug(
-                "media_id=%s no tiene registro en state.json; comentario %s ignorado.",
-                media_id,
-                comment_id,
-            )
-            return
+        keyword_matched = False
+        if media_record and media_record.get("has_keyword_cta"):
+            keyword = str(media_record.get("keyword", "")).strip().upper()
+            keyword_matched = _keyword_matches(keyword, comment_text)
 
-        if not media_record.get("has_keyword_cta"):
+        if not keyword_matched:
+            if interaction_callback is not None and comment_text.strip():
+                await interaction_callback(
+                    interaction_type="COMMENT",
+                    event_id=comment_id,
+                    sender_id=from_id,
+                    sender_username=username,
+                    message_text=comment_text,
+                    media_id=media_id,
+                )
             return
 
         keyword = str(media_record.get("keyword", "")).strip().upper()
-        if not _keyword_matches(keyword, comment_text):
-            return
-
         target_link = str(media_record.get("target_link", "")).strip()
         public_reply_text = str(media_record.get("public_reply_text", "")).strip()
 
@@ -147,7 +160,7 @@ async def _process_comment_event(
                 dm_sent = await _send_private_dm(
                     client=client,
                     ig_user_id=settings.ig_user_id,
-                    access_token=settings.meta_access_token,
+                    access_token=active_token,
                     comment_id=comment_id,
                     message_text=dm_text,
                 )
@@ -161,7 +174,7 @@ async def _process_comment_event(
             if public_reply_text:
                 reply_sent = await _send_public_reply(
                     client=client,
-                    access_token=settings.meta_access_token,
+                    access_token=active_token,
                     comment_id=comment_id,
                     reply_text=public_reply_text,
                 )
@@ -185,7 +198,41 @@ async def _process_comment_event(
         )
 
 
-def create_webhook_app(settings: Settings) -> FastAPI:
+async def _process_dm_event(
+    settings: Settings,
+    message_id: str,
+    sender_id: str,
+    message_text: str,
+    interaction_callback: Callable[..., Awaitable[None]] | None = None,
+) -> None:
+    try:
+        if interaction_callback is None or not message_text.strip():
+            return
+        already_processed = await asyncio.to_thread(
+            is_comment_processed,
+            message_id,
+            settings.state_file_path,
+        )
+        if already_processed:
+            logger.debug("DM mid=%s ya fue procesado; se omite duplicado.", message_id)
+            return
+
+        await interaction_callback(
+            interaction_type="DM",
+            event_id=message_id,
+            sender_id=sender_id,
+            sender_username="",
+            message_text=message_text,
+            media_id="",
+        )
+    except Exception as exc:
+        logger.exception("Error inesperado procesando DM mid=%s: %s", message_id, exc)
+
+
+def create_webhook_app(
+    settings: Settings,
+    interaction_callback: Callable[..., Awaitable[None]] | None = None,
+) -> FastAPI:
     """Create the FastAPI application for Meta Instagram Webhook verification and events."""
     app = FastAPI(
         title="Nel Health Coach Instagram Webhook",
@@ -233,41 +280,72 @@ def create_webhook_app(settings: Settings) -> FastAPI:
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
+
+            # 1. Comment events
             changes = entry.get("changes")
-            if not isinstance(changes, list):
-                continue
+            if isinstance(changes, list):
+                for change in changes:
+                    if not isinstance(change, dict) or change.get("field") != "comments":
+                        continue
 
-            for change in changes:
-                if not isinstance(change, dict) or change.get("field") != "comments":
+                    value = change.get("value")
+                    if not isinstance(value, dict):
+                        continue
+
+                    comment_id = str(value.get("id", "")).strip()
+                    comment_text = str(value.get("text", ""))
+                    media_obj = value.get("media") if isinstance(value.get("media"), dict) else {}
+                    media_id = str(media_obj.get("id", "")).strip()
+                    from_obj = value.get("from") if isinstance(value.get("from"), dict) else {}
+                    from_id = str(from_obj.get("id", "")).strip()
+                    username = str(from_obj.get("username", "")).strip()
+
+                    if not comment_id or not media_id:
+                        continue
+
+                    if from_id and from_id == settings.ig_user_id:
+                        logger.debug("Comentario propio (%s) ignorado.", comment_id)
+                        continue
+
+                    background_tasks.add_task(
+                        _process_comment_event,
+                        settings,
+                        comment_id,
+                        media_id,
+                        comment_text,
+                        username,
+                        from_id,
+                        interaction_callback,
+                    )
+
+            # 2. Direct Message events (`entry[].messaging[]` and `entry[].standby[]`)
+            for dm_bucket_key in ("messaging", "standby"):
+                dm_events = entry.get(dm_bucket_key)
+                if not isinstance(dm_events, list):
                     continue
+                for event in dm_events:
+                    if not isinstance(event, dict):
+                        continue
+                    msg_obj = event.get("message")
+                    if not isinstance(msg_obj, dict) or msg_obj.get("is_echo"):
+                        continue
+                    sender_obj = event.get("sender") if isinstance(event.get("sender"), dict) else {}
+                    sender_id = str(sender_obj.get("id", "")).strip()
+                    mid = str(msg_obj.get("mid", "")).strip()
+                    msg_text = str(msg_obj.get("text", ""))
+                    if not sender_id or not mid or not msg_text.strip():
+                        continue
+                    if sender_id == settings.ig_user_id:
+                        continue
 
-                value = change.get("value")
-                if not isinstance(value, dict):
-                    continue
-
-                comment_id = str(value.get("id", "")).strip()
-                comment_text = str(value.get("text", ""))
-                media_obj = value.get("media") if isinstance(value.get("media"), dict) else {}
-                media_id = str(media_obj.get("id", "")).strip()
-                from_obj = value.get("from") if isinstance(value.get("from"), dict) else {}
-                from_id = str(from_obj.get("id", "")).strip()
-                username = str(from_obj.get("username", "")).strip()
-
-                if not comment_id or not media_id:
-                    continue
-
-                if from_id and from_id == settings.ig_user_id:
-                    logger.debug("Comentario propio (%s) ignorado.", comment_id)
-                    continue
-
-                background_tasks.add_task(
-                    _process_comment_event,
-                    settings,
-                    comment_id,
-                    media_id,
-                    comment_text,
-                    username,
-                )
+                    background_tasks.add_task(
+                        _process_dm_event,
+                        settings,
+                        mid,
+                        sender_id,
+                        msg_text,
+                        interaction_callback,
+                    )
 
         return {"status": "ok"}
 

@@ -15,6 +15,9 @@ DEFAULT_CREDENTIALS_REL = "./credentials/service_account.json"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 DEFAULT_WEBHOOK_VERIFY_TOKEN = "nelhealthcoach_verify_2026"
 DEFAULT_WEBHOOK_PORT = 8000
+DEFAULT_META_SAVED_AUDIENCE_NAME = "mujeres"
+DEFAULT_TIKTOK_PUBLISH_MODE = "DIRECT"
+DEFAULT_TIKTOK_PRIVACY_LEVEL = "PUBLIC_TO_EVERYONE"
 
 
 class ConfigurationError(ValueError):
@@ -36,13 +39,43 @@ class Settings:
 
     meta_access_token: str
     ig_user_id: str
+    telegram_extra_admin_chat_ids: tuple[int, ...] = ()
     meta_ad_account_id: str = ""
+    meta_saved_audience_name: str = DEFAULT_META_SAVED_AUDIENCE_NAME
+    meta_app_id: str = ""
+    meta_app_secret: str = ""
+    meta_location_id_us: str = ""
+    meta_location_id_ca: str = ""
+
+    tiktok_client_key: str = ""
+    tiktok_client_secret: str = ""
+    tiktok_refresh_token: str = ""
+    tiktok_access_token: str = ""
+    tiktok_publish_mode: str = DEFAULT_TIKTOK_PUBLISH_MODE
+    tiktok_privacy_level: str = DEFAULT_TIKTOK_PRIVACY_LEVEL
 
     webhook_verify_token: str = DEFAULT_WEBHOOK_VERIFY_TOKEN
     webhook_port: int = DEFAULT_WEBHOOK_PORT
 
     base_dir: Path = BASE_DIR
     state_file_path: Path = DEFAULT_STATE_PATH
+
+    @property
+    def telegram_admin_chat_ids(self) -> tuple[int, ...]:
+        """Return deduplicated authorized Telegram chat IDs (supports single group or multiple admins)."""
+        ordered: list[int] = [self.telegram_admin_chat_id]
+        for cid in self.telegram_extra_admin_chat_ids:
+            if cid not in ordered:
+                ordered.append(cid)
+        return tuple(ordered)
+
+    @property
+    def tiktok_enabled(self) -> bool:
+        """Return True if TikTok organic publishing credentials are configured."""
+        has_refresh = bool(
+            self.tiktok_refresh_token and self.tiktok_client_key and self.tiktok_client_secret
+        )
+        return has_refresh or bool(self.tiktok_access_token)
 
 
 def _require_env(name: str, missing: list[str]) -> str:
@@ -82,6 +115,7 @@ def load_settings(env_path: str | Path | None = None) -> Settings:
 
     telegram_bot_token = _require_env("TELEGRAM_BOT_TOKEN", missing)
     telegram_chat_raw = _require_env("TELEGRAM_ADMIN_CHAT_ID", missing)
+    extra_chats_raw = os.getenv("TELEGRAM_EXTRA_ADMIN_CHAT_IDS", "").strip()
 
     meta_access_token = _require_env("META_ACCESS_TOKEN", missing)
     ig_user_id = _require_env("IG_USER_ID", missing)
@@ -90,6 +124,28 @@ def load_settings(env_path: str | Path | None = None) -> Settings:
         meta_ad_account_id = f"act_{raw_ad_account}"
     else:
         meta_ad_account_id = raw_ad_account
+    meta_saved_audience_name = (
+        os.getenv("META_SAVED_AUDIENCE_NAME", DEFAULT_META_SAVED_AUDIENCE_NAME).strip()
+        or DEFAULT_META_SAVED_AUDIENCE_NAME
+    )
+    meta_app_id = os.getenv("META_APP_ID", "").strip()
+    meta_app_secret = os.getenv("META_APP_SECRET", "").strip()
+    meta_location_id_us = os.getenv("META_LOCATION_ID_US", "").strip()
+    meta_location_id_ca = os.getenv("META_LOCATION_ID_CA", "").strip()
+
+    tiktok_client_key = os.getenv("TIKTOK_CLIENT_KEY", "").strip()
+    tiktok_client_secret = os.getenv("TIKTOK_CLIENT_SECRET", "").strip()
+    tiktok_refresh_token = os.getenv("TIKTOK_REFRESH_TOKEN", "").strip()
+    tiktok_access_token = os.getenv("TIKTOK_ACCESS_TOKEN", "").strip()
+    raw_tiktok_mode = (
+        os.getenv("TIKTOK_PUBLISH_MODE", DEFAULT_TIKTOK_PUBLISH_MODE).strip().upper()
+        or DEFAULT_TIKTOK_PUBLISH_MODE
+    )
+    tiktok_publish_mode = raw_tiktok_mode if raw_tiktok_mode in {"DIRECT", "INBOX"} else DEFAULT_TIKTOK_PUBLISH_MODE
+    tiktok_privacy_level = (
+        os.getenv("TIKTOK_PRIVACY_LEVEL", DEFAULT_TIKTOK_PRIVACY_LEVEL).strip().upper()
+        or DEFAULT_TIKTOK_PRIVACY_LEVEL
+    )
 
     webhook_verify_token = (
         os.getenv("WEBHOOK_VERIFY_TOKEN", DEFAULT_WEBHOOK_VERIFY_TOKEN).strip()
@@ -111,6 +167,19 @@ def load_settings(env_path: str | Path | None = None) -> Settings:
         raise ConfigurationError(
             "TELEGRAM_ADMIN_CHAT_ID debe ser un número entero válido."
         ) from exc
+
+    extra_admin_ids: list[int] = []
+    if extra_chats_raw:
+        for part in extra_chats_raw.split(","):
+            part_clean = part.strip()
+            if not part_clean:
+                continue
+            try:
+                extra_admin_ids.append(int(part_clean))
+            except ValueError as exc:
+                raise ConfigurationError(
+                    f"TELEGRAM_EXTRA_ADMIN_CHAT_IDS contiene un ID inválido: '{part_clean}'."
+                ) from exc
 
     try:
         webhook_port = int(webhook_port_raw)
@@ -134,9 +203,21 @@ def load_settings(env_path: str | Path | None = None) -> Settings:
         drive_root_folder_id=drive_root_folder_id,
         telegram_bot_token=telegram_bot_token,
         telegram_admin_chat_id=telegram_admin_chat_id,
+        telegram_extra_admin_chat_ids=tuple(extra_admin_ids),
         meta_access_token=meta_access_token,
         ig_user_id=ig_user_id,
         meta_ad_account_id=meta_ad_account_id,
+        meta_saved_audience_name=meta_saved_audience_name,
+        meta_app_id=meta_app_id,
+        meta_app_secret=meta_app_secret,
+        meta_location_id_us=meta_location_id_us,
+        meta_location_id_ca=meta_location_id_ca,
+        tiktok_client_key=tiktok_client_key,
+        tiktok_client_secret=tiktok_client_secret,
+        tiktok_refresh_token=tiktok_refresh_token,
+        tiktok_access_token=tiktok_access_token,
+        tiktok_publish_mode=tiktok_publish_mode,
+        tiktok_privacy_level=tiktok_privacy_level,
         webhook_verify_token=webhook_verify_token,
         webhook_port=webhook_port,
         base_dir=BASE_DIR,

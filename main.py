@@ -9,8 +9,9 @@ from datetime import datetime
 
 import uvicorn
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from telegram import Update
+from telegram import BotCommand, Update
 from telegram.constants import ParseMode
 from telegram.ext import ApplicationBuilder, ContextTypes
 
@@ -18,6 +19,7 @@ from config import ConfigurationError, Settings, load_settings
 from drive_service import (
     create_monthly_guidelines_doc,
     ensure_current_month_folder,
+    ensure_statistics_folder,
     find_previous_month_guidelines_text,
     get_monthly_doc_metadata,
     get_monthly_guidelines,
@@ -168,6 +170,29 @@ async def run_monthly_drive_review(
             )
 
         try:
+            await asyncio.to_thread(
+                ensure_statistics_folder,
+                month_folder_id,
+                settings.google_application_credentials,
+            )
+        except Exception as stats_exc:
+            logger.debug("No se pudo verificar subcarpeta de Estadísticas en %s/%s: %s", year_str, month_str, stats_exc)
+
+        guidelines_text: str | None = None
+        try:
+            guidelines_text = await asyncio.to_thread(
+                get_monthly_guidelines,
+                month_folder_id,
+                settings.google_application_credentials,
+            )
+            await bot_controller.notify_overdue_pautas_if_needed(
+                month_folder_id=month_folder_id,
+                guidelines_text=guidelines_text,
+            )
+        except Exception as exc:
+            logger.debug("No se pudieron revisar pautas atrasadas al inicio del ciclo: %s", exc)
+
+        try:
             pending_files = await asyncio.to_thread(
                 list_pending_files,
                 month_folder_id,
@@ -197,24 +222,25 @@ async def run_monthly_drive_review(
             logger.info("No hay archivos nuevos por evaluar en %s/%s.", year_str, month_str)
             return
 
-        try:
-            guidelines_text = await asyncio.to_thread(
-                get_monthly_guidelines,
-                month_folder_id,
-                settings.google_application_credentials,
-            )
-        except Exception as exc:
-            logger.exception(
-                "Error leyendo las pautas del mes %s/%s: %s",
-                year_str,
-                month_str,
-                exc,
-            )
-            await bot_controller.notify_error(
-                f"Se detectaron {len(candidate_files)} archivo(s) nuevo(s) en {year_str}/{month_str}, "
-                f"pero falló la lectura del Google Doc de pautas: {exc}"
-            )
-            return
+        if guidelines_text is None:
+            try:
+                guidelines_text = await asyncio.to_thread(
+                    get_monthly_guidelines,
+                    month_folder_id,
+                    settings.google_application_credentials,
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Error leyendo las pautas del mes %s/%s: %s",
+                    year_str,
+                    month_str,
+                    exc,
+                )
+                await bot_controller.notify_error(
+                    f"Se detectaron {len(candidate_files)} archivo(s) nuevo(s) en {year_str}/{month_str}, "
+                    f"pero falló la lectura del Google Doc de pautas: {exc}"
+                )
+                return
 
         try:
             classification = await asyncio.to_thread(
@@ -297,7 +323,10 @@ async def run_agent(settings: Settings) -> None:
     register_handlers(application, bot_controller)
     application.add_error_handler(_telegram_error_handler)
 
-    fastapi_app = create_webhook_app(settings)
+    fastapi_app = create_webhook_app(
+        settings,
+        interaction_callback=bot_controller.handle_incoming_ig_interaction,
+    )
     uvicorn_config = uvicorn.Config(
         app=fastapi_app,
         host="0.0.0.0",
@@ -319,6 +348,32 @@ async def run_agent(settings: Settings) -> None:
         logger.info("Bot de Telegram iniciado en modo polling.")
 
         scheduler.start()
+        try:
+            await bot_controller.rehydrate_scheduled_jobs()
+        except Exception as rehydrate_exc:
+            logger.warning("Error restaurando publicaciones programadas tras reinicio: %s", rehydrate_exc)
+
+        async def scheduled_weekly_metrics() -> None:
+            try:
+                await bot_controller.generate_and_save_weekly_report()
+            except Exception as metrics_exc:
+                logger.exception("Error generando informe semanal de métricas: %s", metrics_exc)
+                await bot_controller.notify_error(
+                    f"Error en la generación automática del informe semanal de métricas: {metrics_exc}"
+                )
+
+        async def scheduled_meta_token_check() -> None:
+            try:
+                await bot_controller.check_meta_token_health()
+            except Exception as tok_exc:
+                logger.warning("No se pudo verificar estado de META_ACCESS_TOKEN: %s", tok_exc)
+
+        async def scheduled_ig_dm_poll() -> None:
+            try:
+                await bot_controller.poll_instagram_dms()
+            except Exception as dm_exc:
+                logger.debug("Error en polling de respaldo para DMs/Solicitudes IG: %s", dm_exc)
+
         scheduler.add_job(
             scheduled_review,
             trigger=IntervalTrigger(minutes=DRIVE_POLL_INTERVAL_MINUTES),
@@ -327,19 +382,60 @@ async def run_agent(settings: Settings) -> None:
             next_run_time=datetime.now().astimezone(),
             max_instances=1,
         )
+        scheduler.add_job(
+            scheduled_weekly_metrics,
+            trigger=CronTrigger(day_of_week="sun", hour=20, minute=0),
+            id="weekly_metrics_report_job",
+            replace_existing=True,
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+        scheduler.add_job(
+            scheduled_meta_token_check,
+            trigger=CronTrigger(hour=9, minute=0),
+            id="meta_token_health_job",
+            replace_existing=True,
+            next_run_time=datetime.now().astimezone(),
+            max_instances=1,
+            misfire_grace_time=3600,
+        )
+        scheduler.add_job(
+            scheduled_ig_dm_poll,
+            trigger=IntervalTrigger(minutes=3),
+            id="ig_dm_poll_job",
+            replace_existing=True,
+            max_instances=1,
+        )
         logger.info(
-            "APScheduler iniciado: escaneo de Drive cada %d minutos.",
+            "APScheduler iniciado: escaneo de Drive cada %d min + respaldo DMs cada 3 min + informe semanal domingos 20:00 + chequeo diario de META_ACCESS_TOKEN.",
             DRIVE_POLL_INTERVAL_MINUTES,
         )
 
         try:
-            await application.bot.send_message(
-                chat_id=settings.telegram_admin_chat_id,
+            await application.bot.set_my_commands(
+                [
+                    BotCommand("check", "Escanear Drive ahora y proponer archivos nuevos"),
+                    BotCommand("pautas", "Listar pautas del documento aún sin publicar"),
+                    BotCommand("calendario", "Ver agenda editorial de los próximos 14 días"),
+                    BotCommand("sugerencias", "Analizar tendencias y sugerir nuevas ideas virales"),
+                    BotCommand("guion", "Generar guion listo para grabar y guardarlo en Drive"),
+                    BotCommand("metricas", "Generar informe semanal de métricas en Google Docs"),
+                    BotCommand("token", "Verificar vigencia y renovar META_ACCESS_TOKEN"),
+                    BotCommand("id", "Ver tu Chat ID personal con este bot"),
+                    BotCommand("status", "Ver propuestas pendientes y publicaciones programadas"),
+                    BotCommand("help", "Mostrar ayuda y comandos disponibles"),
+                ]
+            )
+            await bot_controller._send_admin_message(
                 text=(
                     "🟢 <b>Agente @nelhealthcoach iniciado</b>\n"
-                    f"• Drive YYYY/MM cada {DRIVE_POLL_INTERVAL_MINUTES} min\n"
+                    f"• Drive YYYY/MM cada {DRIVE_POLL_INTERVAL_MINUTES} min (Reels, Imágenes y carpetas <code>(CARRUSEL)</code>)\n"
+                    "• Ubicación IG alternada: <code>Estados Unidos</code> ↔ <code>California</code>\n"
+                    "• Comentarios, DMs y Solicitudes de mensaje IG con respuestas asistidas activados\n"
+                    "• Monitoreo diario preventivo de META_ACCESS_TOKEN activado\n"
+                    "• Informe semanal de métricas: Domingos 20:00 hrs\n"
                     f"• Webhook IG en puerto {settings.webhook_port}\n"
-                    "Usa /check para forzar revisión o /status para ver la cola."
+                    "Comandos: /check | /pautas | /calendario | /sugerencias | /guion | /metricas | /token | /id | /status"
                 ),
                 parse_mode=ParseMode.HTML,
             )

@@ -15,6 +15,7 @@ from meta_publisher import GRAPH_API_BASE_URL, _extract_meta_error
 logger = logging.getLogger(__name__)
 
 DEFAULT_ADS_COUNTRIES = ["US", "MX", "CO", "ES", "AR", "CL", "DO", "VE"]
+DEFAULT_SAVED_AUDIENCE_NAME = "mujeres"
 
 
 class MetaAdsError(RuntimeError):
@@ -33,6 +34,8 @@ class MetaAdResult:
     daily_budget_usd: float
     duration_days: int
     status: str
+    audience_used: str = ""
+    payment_method_summary: str = ""
 
 
 async def list_accessible_ad_accounts(access_token: str) -> list[dict[str, Any]]:
@@ -111,6 +114,145 @@ async def _check_boost_eligibility(
         )
 
 
+def _default_fallback_targeting() -> dict[str, Any]:
+    return {
+        "geo_locations": {"countries": DEFAULT_ADS_COUNTRIES},
+        "age_min": 25,
+        "age_max": 54,
+        "publisher_platforms": ["instagram"],
+        "instagram_positions": ["stream", "reels", "story", "explore"],
+    }
+
+
+async def _inspect_ad_account_billing(
+    client: httpx.AsyncClient,
+    normalized_act: str,
+    access_token: str,
+) -> str:
+    """Verify ad account is active and inspect its configured payment method (`funding_source`)."""
+    response = await client.get(
+        f"{GRAPH_API_BASE_URL}/{normalized_act}",
+        params={
+            "fields": "id,name,account_status,disable_reason,funding_source,funding_source_details,currency",
+            "access_token": access_token,
+        },
+    )
+    if response.is_error:
+        logger.warning(
+            "No se pudo inspeccionar facturación de %s: %s",
+            normalized_act,
+            _extract_meta_error(response),
+        )
+        return "Tarjeta predeterminada de la cuenta (no verificable por permisos)"
+
+    payload = response.json()
+    account_status = payload.get("account_status")
+    if account_status is not None and int(account_status) != 1:
+        disable_reason = payload.get("disable_reason", "N/A")
+        raise MetaAdsError(
+            f"La cuenta publicitaria {normalized_act} no está activa "
+            f"(account_status={account_status}, disable_reason={disable_reason}). "
+            "Verifica la tarjeta o el estado de facturación en Meta Ads Manager."
+        )
+
+    details = payload.get("funding_source_details")
+    funding_source = payload.get("funding_source")
+    if isinstance(details, dict) and details.get("display_string"):
+        return str(details["display_string"]).strip()
+    if funding_source:
+        return f"Método de pago activo en cuenta (id={funding_source})"
+
+    logger.warning(
+        "La cuenta %s no devolvió funding_source (puede requerir permiso ads_read/finance o no tener tarjeta vinculada).",
+        normalized_act,
+    )
+    return "Sin detalle visible (Meta cobrará al método principal configurado si existe)"
+
+
+async def _resolve_saved_audience_targeting(
+    client: httpx.AsyncClient,
+    normalized_act: str,
+    audience_name: str,
+    access_token: str,
+) -> tuple[dict[str, Any], str]:
+    """Fetch Saved Audience by name (e.g. 'mujeres') and extract its `targeting` spec for Instagram."""
+    target_norm = audience_name.strip().lower()
+    if not target_norm:
+        return _default_fallback_targeting(), "Predeterminado (sin nombre de público configurado)"
+
+    response = await client.get(
+        f"{GRAPH_API_BASE_URL}/{normalized_act}/saved_audiences",
+        params={
+            "fields": "id,name,targeting",
+            "limit": 100,
+            "access_token": access_token,
+        },
+    )
+    if response.is_error:
+        logger.warning(
+            "No se pudieron consultar saved_audiences de %s (%s); usando targeting predeterminado.",
+            normalized_act,
+            _extract_meta_error(response),
+        )
+        return _default_fallback_targeting(), f"Predeterminado (error consultando '{audience_name}')"
+
+    audiences = response.json().get("data", [])
+    matched = next(
+        (a for a in audiences if str(a.get("name", "")).strip().lower() == target_norm),
+        None,
+    )
+    if matched is None:
+        matched = next(
+            (a for a in audiences if target_norm in str(a.get("name", "")).strip().lower()),
+            None,
+        )
+
+    if matched is None or not isinstance(matched.get("targeting"), dict):
+        logger.warning(
+            "No se encontró el público guardado '%s' en %s; usando targeting predeterminado.",
+            audience_name,
+            normalized_act,
+        )
+        return _default_fallback_targeting(), f"Predeterminado (no se encontró '{audience_name}')"
+
+    targeting = dict(matched["targeting"])
+    for non_ig_key in (
+        "facebook_positions",
+        "messenger_positions",
+        "audience_network_positions",
+        "device_platforms",
+    ):
+        targeting.pop(non_ig_key, None)
+
+    targeting["publisher_platforms"] = ["instagram"]
+    targeting.setdefault("instagram_positions", ["stream", "reels", "story", "explore"])
+
+    matched_name = str(matched.get("name", audience_name))
+    matched_id = str(matched.get("id", ""))
+    label = f"Público guardado '{matched_name}' (id={matched_id})"
+    logger.info("Usando %s para Meta Ads en %s.", label, normalized_act)
+    return targeting, label
+
+
+async def inspect_meta_ads_setup(
+    access_token: str,
+    ad_account_id: str,
+    saved_audience_name: str = DEFAULT_SAVED_AUDIENCE_NAME,
+) -> tuple[str, str]:
+    """Return `(payment_method_summary, audience_summary)` for diagnostics/previews."""
+    if not ad_account_id:
+        return "META_AD_ACCOUNT_ID no configurado", "N/A"
+    normalized_act = (
+        ad_account_id if ad_account_id.startswith("act_") else f"act_{ad_account_id}"
+    )
+    async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as client:
+        payment_summary = await _inspect_ad_account_billing(client, normalized_act, access_token)
+        _, audience_label = await _resolve_saved_audience_targeting(
+            client, normalized_act, saved_audience_name, access_token
+        )
+        return payment_summary, audience_label
+
+
 async def promote_instagram_post(
     access_token: str,
     ig_user_id: str,
@@ -120,8 +262,9 @@ async def promote_instagram_post(
     daily_budget_usd: float,
     duration_days: int,
     target_link: str = "",
+    saved_audience_name: str = DEFAULT_SAVED_AUDIENCE_NAME,
 ) -> MetaAdResult:
-    """Create Campaign -> AdSet -> AdCreative (`source_instagram_media_id`) -> Ad in Meta Ads."""
+    """Create Campaign -> AdSet (using saved audience + account card) -> AdCreative -> Ad in Meta Ads."""
     normalized_act = (
         ad_account_id if ad_account_id.startswith("act_") else f"act_{ad_account_id}"
     )
@@ -136,6 +279,13 @@ async def promote_instagram_post(
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
         await _check_boost_eligibility(client, ig_media_id, access_token)
+        payment_summary = await _inspect_ad_account_billing(client, normalized_act, access_token)
+        targeting, audience_used = await _resolve_saved_audience_targeting(
+            client,
+            normalized_act,
+            saved_audience_name,
+            access_token,
+        )
         page_id = await _resolve_facebook_page_id(client, access_token, ig_user_id)
 
         # 1. Campaign
@@ -157,13 +307,6 @@ async def promote_instagram_post(
         campaign_id = str(camp_resp.json()["id"])
 
         # 2. AdSet
-        targeting = {
-            "geo_locations": {"countries": DEFAULT_ADS_COUNTRIES},
-            "age_min": 25,
-            "age_max": 54,
-            "publisher_platforms": ["instagram"],
-            "instagram_positions": ["stream", "reels", "story", "explore"],
-        }
         adset_resp = await client.post(
             f"{GRAPH_API_BASE_URL}/{normalized_act}/adsets",
             data={
@@ -224,13 +367,15 @@ async def promote_instagram_post(
         ad_id = str(ad_resp.json()["id"])
 
     logger.info(
-        "Promoción Meta Ads creada: ad_account=%s, campaign=%s, adset=%s, ad=%s ($%.2f/día x %d días).",
+        "Promoción Meta Ads creada: ad_account=%s, campaign=%s, adset=%s, ad=%s ($%.2f/día x %d días, audience=%s, pago=%s).",
         normalized_act,
         campaign_id,
         adset_id,
         ad_id,
         safe_daily_usd,
         safe_days,
+        audience_used,
+        payment_summary,
     )
     return MetaAdResult(
         ad_account_id=normalized_act,
@@ -241,4 +386,44 @@ async def promote_instagram_post(
         daily_budget_usd=safe_daily_usd,
         duration_days=safe_days,
         status="ACTIVE",
+        audience_used=audience_used,
+        payment_method_summary=payment_summary,
     )
+
+
+async def fetch_meta_ads_weekly_insights(
+    access_token: str,
+    ad_account_id: str,
+    since_date: str,
+    until_date: str,
+) -> list[dict[str, Any]]:
+    """Fetch campaign-level Meta Ads performance metrics for `[since_date, until_date]`."""
+    if not ad_account_id:
+        return []
+
+    normalized_act = (
+        ad_account_id if ad_account_id.startswith("act_") else f"act_{ad_account_id}"
+    )
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as client:
+            response = await client.get(
+                f"{GRAPH_API_BASE_URL}/{normalized_act}/insights",
+                params={
+                    "level": "campaign",
+                    "fields": "campaign_id,campaign_name,spend,impressions,reach,clicks,cpc,cpm,actions",
+                    "time_range": json.dumps({"since": since_date, "until": until_date}),
+                    "limit": 50,
+                    "access_token": access_token,
+                },
+            )
+            if response.is_error:
+                logger.warning(
+                    "No se pudieron consultar métricas de Meta Ads (%s): %s",
+                    normalized_act,
+                    _extract_meta_error(response),
+                )
+                return []
+            return list(response.json().get("data", []))
+    except Exception as exc:
+        logger.warning("Error consultando insights de Meta Ads (%s): %s", normalized_act, exc)
+        return []
