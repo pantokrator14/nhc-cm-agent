@@ -71,6 +71,7 @@ from drive_service import (
     parse_guidelines_entries,
     remove_scheduled_session,
     rename_drive_file,
+    resolve_metrics_reference_dt,
     revoke_public_permission,
     save_performance_memory,
     save_scheduled_session,
@@ -104,10 +105,10 @@ from meta_ads_service import (
 from meta_publisher import (
     MetaTokenStatus,
     check_and_refresh_meta_token,
+    fetch_instagram_dm_messages_with_status,
     fetch_instagram_media_context,
     fetch_instagram_user_profile,
     fetch_instagram_weekly_metrics,
-    fetch_recent_instagram_dm_messages,
     fetch_recent_instagram_media,
     publish_carousel_to_instagram,
     publish_to_instagram,
@@ -2731,11 +2732,12 @@ class NelHealthCoachBot:
             f"desde el webhook (puerto <b>{self.settings.webhook_port}</b>).\n"
             "Comandos disponibles:\n"
             "• /check — Escanear la carpeta del mes, detectar pautas atrasadas y proponer archivos nuevos\n"
+            "• /mensajes (o /dms) — Revisar DMs y solicitudes de mensajes pendientes en Instagram\n"
             "• /pautas — Listar pautas del documento aún sin publicar (editar fecha, caption o publicar)\n"
             "• /calendario — Ver agenda y huecos libres de los próximos 14 días\n"
             "• /sugerencias (o /suggest, /tendencias) — Analizar tendencias actuales y sugerir nuevas ideas virales\n"
             "• /guion [tema] — Generar un guion hablado listo para grabar y guardarlo en Drive\n"
-            "• /metricas (o /informe) — Generar el informe semanal en Google Docs (Estadísticas/Semana X)\n"
+            "• /metricas [anterior | semana N | fecha] — Generar informe semanal en Google Docs\n"
             "• /token — Verificar vigencia y renovar META_ACCESS_TOKEN\n"
             "• /id — Ver tu Chat ID personal con este bot (para los 3 administradores)\n"
             "• /status — Ver propuestas pendientes y publicaciones programadas",
@@ -2897,14 +2899,84 @@ class NelHealthCoachBot:
         if not self._is_authorized_admin(update):
             return
 
+        now = self._get_reference_now()
+        try:
+            target_dt, period_label = resolve_metrics_reference_dt(context.args or [], now)
+        except ValueError as exc:
+            await update.effective_message.reply_text(
+                f"⚠️ {html.escape(str(exc))}\n\n"
+                "<b>Ejemplos de uso:</b>\n"
+                "• <code>/metricas</code> — semana actual\n"
+                "• <code>/metricas anterior</code> — semana pasada\n"
+                "• <code>/metricas semana 3</code> — semana 3 del mes actual\n"
+                "• <code>/metricas 2026-11-22</code> — semana que contiene esa fecha",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
         await update.effective_message.reply_text(
-            "📊 Recopilando métricas de Instagram, Meta Ads y TikTok para generar el informe en Google Docs..."
+            f"📊 Recopilando métricas de Instagram, Meta Ads y TikTok para <b>{html.escape(period_label)}</b>...",
+            parse_mode=ParseMode.HTML,
         )
         try:
-            await self.generate_and_save_weekly_report()
+            await self.generate_and_save_weekly_report(reference_dt=target_dt)
         except Exception as exc:
             logger.exception("Error ejecutando /metricas: %s", exc)
             await self.notify_error(f"Error generando informe semanal de métricas: {exc}")
+
+    async def cmd_mensajes(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if not self._is_authorized_admin(update):
+            return
+
+        await update.effective_message.reply_text(
+            "📩 Revisando mensajes directos y solicitudes de mensajes en Instagram (últimos 30 días)..."
+        )
+        try:
+            forwarded, total_found, error_msg = await self._poll_instagram_dms_detailed(
+                limit_conversations=25,
+                since_minutes=43200,
+            )
+        except Exception as exc:
+            logger.exception("Error ejecutando /mensajes: %s", exc)
+            await self.notify_error(f"Error consultando mensajes de Instagram: {exc}")
+            return
+
+        if error_msg:
+            await update.effective_message.reply_text(
+                "⚠️ <b>No se pudieron consultar los DMs/Solicitudes desde la API de Meta:</b>\n"
+                f"<code>{html.escape(error_msg)}</code>\n\n"
+                "<b>Qué revisar en Meta / Instagram:</b>\n"
+                "1. En la app de Instagram: <i>Configuración → Mensajes y respuestas a historias → Controles de mensajes → Herramientas conectadas → Permitir acceso a los mensajes</i> (activado).\n"
+                "2. En Meta App Dashboard: permiso <code>instagram_manage_messages</code> (o <code>pages_messaging</code>) con <b>Acceso avanzado</b> y app en modo <b>Live</b>.\n"
+                "3. Webhook suscrito a <code>comments</code>, <code>messages</code> y <code>standby</code>.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        pending_in_memory = len(
+            [s for s in self.pending_ig_interactions.values() if s.status == "pending"]
+        )
+        if forwarded > 0:
+            await update.effective_message.reply_text(
+                f"✅ Se detectaron y enviaron <b>{forwarded}</b> mensaje(s)/solicitud(es) pendiente(s) con sugerencias de respuesta.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        extra = (
+            f" Ya tienes <b>{pending_in_memory}</b> tarjeta(s) pendiente(s) arriba sin responder/ignorar."
+            if pending_in_memory > 0
+            else ""
+        )
+        await update.effective_message.reply_text(
+            f"✅ Revisión completada: no hay mensajes o solicitudes nuevas sin procesar (hilos sin responder detectados por API: {total_found}).{extra}\n\n"
+            "<i>Nota: Meta solo expone solicitudes activas de los últimos 30 días y requiere tener activado 'Permitir acceso a los mensajes' en Instagram.</i>",
+            parse_mode=ParseMode.HTML,
+        )
 
     def _format_ig_interaction_html(self, session: IgInteractionSession) -> str:
         kind_badge = (
@@ -3269,15 +3341,23 @@ class NelHealthCoachBot:
                 self.awaiting_ig_refine_by_chat.pop(k_cid, None)
             await self._sync_ig_interaction_cards(session)
 
-    async def poll_instagram_dms(self) -> int:
-        """Poll Instagram Conversations API to catch DMs and Message Requests not delivered by webhook."""
+    async def _poll_instagram_dms_detailed(
+        self,
+        *,
+        limit_conversations: int = 20,
+        since_minutes: int = 4320,
+    ) -> tuple[int, int, str | None]:
+        """Poll Instagram Conversations API and return `(forwarded, total_found, error_msg)`."""
         meta_token = await asyncio.to_thread(self._get_effective_meta_token)
-        recent_dms = await fetch_recent_instagram_dm_messages(
+        recent_dms, error_msg = await fetch_instagram_dm_messages_with_status(
             ig_user_id=self.settings.ig_user_id,
             access_token=meta_token,
-            limit_conversations=15,
-            since_minutes=1440,
+            limit_conversations=limit_conversations,
+            since_minutes=since_minutes,
         )
+        if error_msg:
+            return 0, 0, error_msg
+
         forwarded = 0
         for dm in recent_dms:
             event_id = dm.get("event_id", "")
@@ -3301,6 +3381,11 @@ class NelHealthCoachBot:
                 media_id="",
             )
             forwarded += 1
+        return forwarded, len(recent_dms), None
+
+    async def poll_instagram_dms(self) -> int:
+        """Poll Instagram Conversations API to catch DMs and Message Requests not delivered by webhook."""
+        forwarded, _, _ = await self._poll_instagram_dms_detailed()
         return forwarded
 
     async def check_meta_token_health(self, *, notify_always: bool = False) -> MetaTokenStatus:
@@ -3529,6 +3614,7 @@ def register_handlers(application: Application, bot_controller: NelHealthCoachBo
     bot_controller.application = application
     application.add_handler(CommandHandler(["start", "help"], bot_controller.cmd_start))
     application.add_handler(CommandHandler("check", bot_controller.cmd_check))
+    application.add_handler(CommandHandler(["mensajes", "dms", "inbox"], bot_controller.cmd_mensajes))
     application.add_handler(CommandHandler(["pautas", "pendientes"], bot_controller.cmd_pautas))
     application.add_handler(CommandHandler("calendario", bot_controller.cmd_calendario))
     application.add_handler(

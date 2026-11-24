@@ -530,6 +530,18 @@ async def send_instagram_dm(
                 "access_token": access_token,
             },
         )
+        if resp.is_error and resp.status_code in {400, 404}:
+            page_creds = await _resolve_linked_page_credentials(client, ig_user_id, access_token)
+            if page_creds is not None:
+                page_id, page_token = page_creds
+                resp = await client.post(
+                    f"{GRAPH_API_BASE_URL}/{page_id}/messages",
+                    json={
+                        "recipient": {"id": recipient_id},
+                        "message": {"text": message_text},
+                        "access_token": page_token,
+                    },
+                )
         if resp.is_error:
             raise MetaPublisherError(
                 f"Error enviando DM a {recipient_id}: {_extract_meta_error(resp)}"
@@ -800,46 +812,118 @@ async def resolve_instagram_location_id(
     return ""
 
 
-async def fetch_recent_instagram_dm_messages(
+def _parse_meta_timestamp(raw_ts: str) -> datetime | None:
+    """Parse an ISO-8601 Meta Graph timestamp into an aware UTC datetime."""
+    cleaned = raw_ts.strip()
+    if not cleaned:
+        return None
+    normalized = cleaned.replace("Z", "+00:00")
+    if len(normalized) >= 5 and normalized[-5] in {"+", "-"} and ":" not in normalized[-5:]:
+        normalized = f"{normalized[:-2]}:{normalized[-2:]}"
+    try:
+        dt = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+async def _resolve_linked_page_credentials(
+    client: httpx.AsyncClient,
+    ig_user_id: str,
+    access_token: str,
+) -> tuple[str, str] | None:
+    """Resolve `(page_id, page_access_token)` linked to `ig_user_id` via `/me/accounts`."""
+    try:
+        resp = await client.get(
+            f"{GRAPH_API_BASE_URL}/me/accounts",
+            params={
+                "fields": "id,name,access_token,instagram_business_account{id}",
+                "limit": 25,
+                "access_token": access_token,
+            },
+        )
+        if resp.is_error:
+            return None
+        pages = resp.json().get("data") or []
+        fallback_pair: tuple[str, str] | None = None
+        for page in pages:
+            if not isinstance(page, dict):
+                continue
+            page_id = str(page.get("id", "")).strip()
+            page_token = str(page.get("access_token", "")).strip() or access_token
+            if not page_id:
+                continue
+            ig_acct = page.get("instagram_business_account")
+            linked_ig_id = str(ig_acct.get("id", "")).strip() if isinstance(ig_acct, dict) else ""
+            if linked_ig_id == ig_user_id:
+                return page_id, page_token
+            if linked_ig_id and fallback_pair is None:
+                fallback_pair = (page_id, page_token)
+        return fallback_pair
+    except Exception:
+        return None
+
+
+async def fetch_instagram_dm_messages_with_status(
     ig_user_id: str,
     access_token: str,
     *,
-    limit_conversations: int = 15,
-    since_minutes: int = 1440,
-) -> list[dict[str, str]]:
-    """Poll Instagram Conversations API (`platform=instagram`) to catch inbox and Message Requests."""
+    limit_conversations: int = 20,
+    since_minutes: int = 4320,
+) -> tuple[list[dict[str, str]], str | None]:
+    """Poll Instagram Conversations API (`platform=instagram`) and return `(messages, error_msg)`."""
     cutoff_utc = datetime.now(timezone.utc) - timedelta(minutes=max(1, int(since_minutes)))
-    params = {
+    base_params = {
         "platform": "instagram",
-        "fields": "id,updated_time,participants,messages.limit(5){id,created_time,from,message}",
+        "fields": "id,updated_time,participants,messages.limit(10){id,created_time,from,message}",
         "limit": min(max(int(limit_conversations), 1), 25),
-        "access_token": access_token,
     }
     threads: list[dict[str, Any]] = []
+    own_sender_ids: set[str] = {ig_user_id}
+    last_error: str | None = None
+
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
-            resp = await client.get(
-                f"{GRAPH_API_BASE_URL}/{ig_user_id}/conversations",
-                params=params,
-            )
-            if resp.is_error and resp.status_code in {400, 404}:
-                resp = await client.get(
-                    f"{GRAPH_API_BASE_URL}/me/conversations",
-                    params=params,
-                )
-            if resp.is_error:
-                logger.debug(
+            candidates: list[tuple[str, str]] = [
+                (f"{GRAPH_API_BASE_URL}/{ig_user_id}/conversations", access_token),
+                (f"{GRAPH_API_BASE_URL}/me/conversations", access_token),
+            ]
+            resp: httpx.Response | None = None
+            for endpoint, tok in candidates:
+                resp = await client.get(endpoint, params={**base_params, "access_token": tok})
+                if not resp.is_error:
+                    break
+                last_error = _extract_meta_error(resp)
+
+            if resp is not None and resp.is_error:
+                page_creds = await _resolve_linked_page_credentials(client, ig_user_id, access_token)
+                if page_creds is not None:
+                    page_id, page_token = page_creds
+                    own_sender_ids.add(page_id)
+                    resp = await client.get(
+                        f"{GRAPH_API_BASE_URL}/{page_id}/conversations",
+                        params={**base_params, "access_token": page_token},
+                    )
+                    if resp.is_error:
+                        last_error = _extract_meta_error(resp)
+
+            if resp is None or resp.is_error:
+                logger.warning(
                     "Polling Conversations IG no disponible (%s): %s",
-                    resp.status_code,
-                    _extract_meta_error(resp),
+                    resp.status_code if resp is not None else "N/A",
+                    last_error or "Error desconocido",
                 )
-                return []
+                return [], last_error or "Error consultando Conversations API de Meta"
+
+            last_error = None
             raw_threads = resp.json().get("data") or []
             if isinstance(raw_threads, list):
                 threads = raw_threads
     except Exception as exc:
-        logger.debug("Error consultando Conversations API de IG: %s", exc)
-        return []
+        logger.warning("Error consultando Conversations API de IG: %s", exc)
+        return [], str(exc)
 
     collected: list[dict[str, str]] = []
     for thread in threads:
@@ -851,30 +935,35 @@ async def fetch_recent_instagram_dm_messages(
             if isinstance(p, dict) and p.get("id"):
                 participants_map[str(p["id"])] = str(p.get("username") or p.get("name") or "").strip()
 
-        raw_msgs = (thread.get("messages") or {}).get("data") or []
+        raw_msgs = [
+            m for m in ((thread.get("messages") or {}).get("data") or []) if isinstance(m, dict)
+        ]
+        # Sort newest-first when timestamps are present so we stop at our latest outgoing reply.
+        if any(m.get("created_time") for m in raw_msgs):
+            raw_msgs.sort(
+                key=lambda m: _parse_meta_timestamp(str(m.get("created_time", "")))
+                or datetime.min.replace(tzinfo=timezone.utc),
+                reverse=True,
+            )
+
         for msg in raw_msgs:
-            if not isinstance(msg, dict):
-                continue
-            mid = str(msg.get("id", "")).strip()
-            text = str(msg.get("message", "") or "").strip()
             from_obj = msg.get("from") if isinstance(msg.get("from"), dict) else {}
             from_id = str(from_obj.get("id", "")).strip()
+            if from_id and from_id in own_sender_ids:
+                # Thread already answered by us; older messages before this reply are already handled.
+                break
+
+            mid = str(msg.get("id", "")).strip()
+            text = str(msg.get("message", "") or "").strip()
             from_username = str(from_obj.get("username") or participants_map.get(from_id, "")).strip()
             created_raw = str(msg.get("created_time", "")).strip()
-            if not mid or not text or not from_id or from_id == ig_user_id:
+            if not mid or not text or not from_id:
                 continue
-            if created_raw:
-                try:
-                    normalized_ts = created_raw.replace("Z", "+00:00")
-                    if len(normalized_ts) >= 5 and normalized_ts[-5] in {"+", "-"} and ":" not in normalized_ts[-5:]:
-                        normalized_ts = f"{normalized_ts[:-2]}:{normalized_ts[-2:]}"
-                    created_dt = datetime.fromisoformat(normalized_ts)
-                    if created_dt.tzinfo is None:
-                        created_dt = created_dt.replace(tzinfo=timezone.utc)
-                    if created_dt.astimezone(timezone.utc) < cutoff_utc:
-                        continue
-                except ValueError:
-                    pass
+
+            created_dt = _parse_meta_timestamp(created_raw) if created_raw else None
+            if created_dt is not None and created_dt < cutoff_utc:
+                continue
+
             collected.append(
                 {
                     "event_id": mid,
@@ -886,4 +975,21 @@ async def fetch_recent_instagram_dm_messages(
             )
 
     collected.sort(key=lambda item: item.get("created_time", ""))
-    return collected
+    return collected, None
+
+
+async def fetch_recent_instagram_dm_messages(
+    ig_user_id: str,
+    access_token: str,
+    *,
+    limit_conversations: int = 20,
+    since_minutes: int = 4320,
+) -> list[dict[str, str]]:
+    """Poll Instagram Conversations API (`platform=instagram`) to catch inbox and Message Requests."""
+    messages, _ = await fetch_instagram_dm_messages_with_status(
+        ig_user_id=ig_user_id,
+        access_token=access_token,
+        limit_conversations=limit_conversations,
+        since_minutes=since_minutes,
+    )
+    return messages

@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import uvicorn
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -376,7 +376,7 @@ async def run_agent(settings: Settings) -> None:
             try:
                 await bot_controller.poll_instagram_dms()
             except Exception as dm_exc:
-                logger.debug("Error en polling de respaldo para DMs/Solicitudes IG: %s", dm_exc)
+                logger.warning("Error en polling de respaldo para DMs/Solicitudes IG: %s", dm_exc)
 
         scheduler.add_job(
             scheduled_review,
@@ -408,6 +408,7 @@ async def run_agent(settings: Settings) -> None:
             trigger=IntervalTrigger(minutes=3),
             id="ig_dm_poll_job",
             replace_existing=True,
+            next_run_time=datetime.now().astimezone() + timedelta(seconds=20),
             max_instances=1,
         )
         logger.info(
@@ -419,11 +420,12 @@ async def run_agent(settings: Settings) -> None:
             await application.bot.set_my_commands(
                 [
                     BotCommand("check", "Escanear Drive ahora y proponer archivos nuevos"),
+                    BotCommand("mensajes", "Revisar DMs y solicitudes de mensajes en Instagram"),
                     BotCommand("pautas", "Listar pautas del documento aún sin publicar"),
                     BotCommand("calendario", "Ver agenda editorial de los próximos 14 días"),
                     BotCommand("sugerencias", "Analizar tendencias y sugerir nuevas ideas virales"),
                     BotCommand("guion", "Generar guion listo para grabar y guardarlo en Drive"),
-                    BotCommand("metricas", "Generar informe semanal de métricas en Google Docs"),
+                    BotCommand("metricas", "Generar informe semanal (opcional: anterior o semana N)"),
                     BotCommand("token", "Verificar vigencia y renovar META_ACCESS_TOKEN"),
                     BotCommand("id", "Ver tu Chat ID personal con este bot"),
                     BotCommand("status", "Ver propuestas pendientes y publicaciones programadas"),
@@ -439,7 +441,7 @@ async def run_agent(settings: Settings) -> None:
                     "• Monitoreo diario preventivo de META_ACCESS_TOKEN activado\n"
                     "• Informe semanal de métricas: Domingos 20:00 hrs\n"
                     f"• Webhook IG en puerto {settings.webhook_port}\n"
-                    "Comandos: /check | /pautas | /calendario | /sugerencias | /guion | /metricas | /token | /id | /status"
+                    "Comandos: /check | /mensajes | /pautas | /calendario | /sugerencias | /guion | /metricas | /token | /id | /status"
                 ),
                 parse_mode=ParseMode.HTML,
             )

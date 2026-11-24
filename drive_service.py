@@ -2472,17 +2472,9 @@ def mark_entry_published_in_monthly_doc(
         ) from drive_exc
 
 
-def compute_month_week_info(reference_dt: datetime) -> tuple[int, datetime, datetime]:
-    """Compute `(week_number, week_start_dt, week_end_dt)` within the month of `reference_dt`.
-
-    Weeks close on Sunday (`weekday() == 6`). If the 1st of the month is Sunday, it is
-    grouped into Week 1 along with the following Mon-Sun so Week 1 is never a single day.
-    """
-    year = reference_dt.year
-    month = reference_dt.month
-    tz = reference_dt.tzinfo
+def list_month_weeks(year: int, month: int) -> list[tuple[int, int]]:
+    """Return `[(start_day, end_day), ...]` for Sunday-closing weeks in `year/month`."""
     days_in_month = calendar.monthrange(year, month)[1]
-
     weeks: list[tuple[int, int]] = []
     start_day = 1
     for day in range(1, days_in_month + 1):
@@ -2492,6 +2484,19 @@ def compute_month_week_info(reference_dt: datetime) -> tuple[int, datetime, date
             start_day = day + 1
     if start_day <= days_in_month:
         weeks.append((start_day, days_in_month))
+    return weeks
+
+
+def compute_month_week_info(reference_dt: datetime) -> tuple[int, datetime, datetime]:
+    """Compute `(week_number, week_start_dt, week_end_dt)` within the month of `reference_dt`.
+
+    Weeks close on Sunday (`weekday() == 6`). If the 1st of the month is Sunday, it is
+    grouped into Week 1 along with the following Mon-Sun so Week 1 is never a single day.
+    """
+    year = reference_dt.year
+    month = reference_dt.month
+    tz = reference_dt.tzinfo
+    weeks = list_month_weeks(year, month)
 
     target_day = reference_dt.day
     for idx, (s_day, e_day) in enumerate(weeks, start=1):
@@ -2508,6 +2513,73 @@ def is_last_weekly_report_of_month(reference_dt: datetime) -> bool:
     _, _, week_end = compute_month_week_info(reference_dt)
     days_in_month = calendar.monthrange(reference_dt.year, reference_dt.month)[1]
     return (days_in_month - week_end.day) < 7
+
+
+def resolve_metrics_reference_dt(
+    raw_args: list[str],
+    now: datetime,
+) -> tuple[datetime, str]:
+    """Resolve optional `/metricas` arguments into `(reference_dt, period_label)`.
+
+    Supports:
+    - no arguments -> current week (`now`)
+    - `anterior` / `pasada` / `prev` -> previous week (even across month boundaries)
+    - `semana N` / `N` [optional `YYYY-MM` or `MM/YYYY`] -> week N of month
+    - `YYYY-MM-DD` / `DD/MM/YYYY` -> week containing that date
+    """
+    cleaned = [a.strip() for a in raw_args if a and a.strip()]
+    if not cleaned:
+        w_num, w_start, w_end = compute_month_week_info(now)
+        return now, f"Semana {w_num} ({w_start.strftime('%d/%m')} al {w_end.strftime('%d/%m')})"
+
+    joined = " ".join(cleaned).strip().lower()
+    if joined in {"anterior", "pasada", "prev", "previous", "ultima", "última"}:
+        _, week_start, _ = compute_month_week_info(now)
+        target_dt = (week_start - timedelta(days=1)).replace(
+            hour=20, minute=0, second=0, microsecond=0
+        )
+        w_num, w_start, w_end = compute_month_week_info(target_dt)
+        return target_dt, f"Semana {w_num} ({w_start.strftime('%d/%m')} al {w_end.strftime('%d/%m')})"
+
+    date_match = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", joined)
+    if date_match:
+        y, m, d = int(date_match.group(1)), int(date_match.group(2)), int(date_match.group(3))
+        target_dt = datetime(y, m, d, 20, 0, 0, tzinfo=now.tzinfo)
+        w_num, w_start, w_end = compute_month_week_info(target_dt)
+        return target_dt, f"Semana {w_num} ({w_start.strftime('%d/%m')} al {w_end.strftime('%d/%m')})"
+
+    dmy_match = re.fullmatch(r"(\d{1,2})[/-](\d{1,2})[/-](\d{4})", joined)
+    if dmy_match:
+        d, m, y = int(dmy_match.group(1)), int(dmy_match.group(2)), int(dmy_match.group(3))
+        target_dt = datetime(y, m, d, 20, 0, 0, tzinfo=now.tzinfo)
+        w_num, w_start, w_end = compute_month_week_info(target_dt)
+        return target_dt, f"Semana {w_num} ({w_start.strftime('%d/%m')} al {w_end.strftime('%d/%m')})"
+
+    week_match = re.fullmatch(
+        r"(?:semana\s*|s)?(\d{1,2})(?:\s+(?:(\d{4})-(\d{1,2})|(\d{1,2})[/-](\d{4})))?",
+        joined,
+    )
+    if week_match:
+        week_idx = int(week_match.group(1))
+        if week_match.group(2) and week_match.group(3):
+            target_year, target_month = int(week_match.group(2)), int(week_match.group(3))
+        elif week_match.group(4) and week_match.group(5):
+            target_month, target_year = int(week_match.group(4)), int(week_match.group(5))
+        else:
+            target_year, target_month = now.year, now.month
+
+        if not (1 <= target_month <= 12):
+            raise ValueError(f"Mes inválido: {target_month}.")
+        weeks = list_month_weeks(target_year, target_month)
+        if not (1 <= week_idx <= len(weeks)):
+            raise ValueError(
+                f"{target_year}/{target_month:02d} solo tiene semanas del 1 al {len(weeks)}."
+            )
+        s_day, e_day = weeks[week_idx - 1]
+        target_dt = datetime(target_year, target_month, e_day, 20, 0, 0, tzinfo=now.tzinfo)
+        return target_dt, f"Semana {week_idx} ({s_day:02d}/{target_month:02d} al {e_day:02d}/{target_month:02d})"
+
+    raise ValueError(f"Formato no reconocido: '{' '.join(cleaned)}'.")
 
 
 def _find_or_create_subfolder_ci(

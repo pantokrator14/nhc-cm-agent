@@ -280,5 +280,172 @@ class TestWeeklyReportAndScriptWorkflows(unittest.IsolatedAsyncioTestCase):
             self.assertIn("No se pudo guardar automáticamente en Google Docs", sent_text)
 
 
+class TestMetricsArgsAndDmPolling(unittest.IsolatedAsyncioTestCase):
+    def test_resolve_metrics_reference_dt_supports_previous_and_specific_week(self) -> None:
+        from drive_service import compute_month_week_info, resolve_metrics_reference_dt
+
+        tz = timezone.utc
+        tue_week4 = datetime(2026, 11, 24, 15, 0, tzinfo=tz)
+
+        # `anterior` from week 4 (23-29 Nov) resolves to week 3 (16-22 Nov)
+        prev_dt, prev_label = resolve_metrics_reference_dt(["anterior"], tue_week4)
+        w_num, w_start, w_end = compute_month_week_info(prev_dt)
+        self.assertEqual(w_num, 3)
+        self.assertEqual((w_start.day, w_end.day), (16, 22))
+        self.assertIn("Semana 3", prev_label)
+
+        # `semana 3` or `3` resolves to week 3
+        s3_dt, _ = resolve_metrics_reference_dt(["semana", "3"], tue_week4)
+        self.assertEqual(compute_month_week_info(s3_dt)[0], 3)
+        n3_dt, _ = resolve_metrics_reference_dt(["3"], tue_week4)
+        self.assertEqual(compute_month_week_info(n3_dt)[0], 3)
+
+        # Explicit date resolves to that week
+        d_dt, _ = resolve_metrics_reference_dt(["2026-11-22"], tue_week4)
+        self.assertEqual(compute_month_week_info(d_dt)[0], 3)
+
+        # Invalid week raises ValueError
+        with self.assertRaises(ValueError):
+            resolve_metrics_reference_dt(["semana", "9"], tue_week4)
+
+    async def test_cmd_metricas_accepts_previous_week_argument(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            bot_ctrl, _ = _make_bot(tmp)
+            bot_ctrl._get_reference_now = MagicMock(
+                return_value=datetime(2026, 11, 24, 15, 0, tzinfo=timezone.utc)
+            )
+            bot_ctrl.generate_and_save_weekly_report = AsyncMock()
+
+            reply_msg = MagicMock()
+            reply_msg.reply_text = AsyncMock()
+            update = SimpleNamespace(
+                effective_chat=SimpleNamespace(id=1001),
+                effective_user=SimpleNamespace(first_name="Admin"),
+                effective_message=reply_msg,
+            )
+            context = SimpleNamespace(args=["anterior"])
+
+            await bot_ctrl.cmd_metricas(update, context)
+
+            bot_ctrl.generate_and_save_weekly_report.assert_awaited_once()
+            passed_dt = bot_ctrl.generate_and_save_weekly_report.call_args.kwargs["reference_dt"]
+            self.assertEqual(passed_dt.day, 22)
+            self.assertEqual(passed_dt.month, 11)
+            self.assertIn("Semana 3", reply_msg.reply_text.call_args.args[0])
+
+    async def test_cmd_mensajes_reports_meta_api_error_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            bot_ctrl, _ = _make_bot(tmp)
+            reply_msg = MagicMock()
+            reply_msg.reply_text = AsyncMock()
+            update = SimpleNamespace(
+                effective_chat=SimpleNamespace(id=1001),
+                effective_user=SimpleNamespace(first_name="Admin"),
+                effective_message=reply_msg,
+            )
+            context = SimpleNamespace(args=[])
+
+            with patch(
+                "telegram_bot.fetch_instagram_dm_messages_with_status",
+                AsyncMock(return_value=([], "Requires instagram_manage_messages (code=200)")),
+            ):
+                await bot_ctrl.cmd_mensajes(update, context)
+
+            final_reply = reply_msg.reply_text.call_args_list[-1].args[0]
+            self.assertIn("instagram_manage_messages", final_reply)
+
+    async def test_fetch_dm_messages_resolves_linked_page_and_skips_answered_threads(self) -> None:
+        from meta_publisher import fetch_instagram_dm_messages_with_status
+
+        def _fake_resp(status: int, payload: dict) -> MagicMock:
+            resp = MagicMock()
+            resp.status_code = status
+            resp.is_error = status >= 400
+            resp.json.return_value = payload
+            resp.text = json.dumps(payload)
+            return resp
+
+        async def _mock_get(url: str, params: dict | None = None):
+            if "/ig-123/conversations" in url or "/me/conversations" in url:
+                return _fake_resp(400, {"error": {"message": "Unsupported get request", "code": 100}})
+            if "/me/accounts" in url:
+                return _fake_resp(
+                    200,
+                    {
+                        "data": [
+                            {
+                                "id": "page-999",
+                                "name": "Nel Health Coach",
+                                "access_token": "page-tok",
+                                "instagram_business_account": {"id": "ig-123"},
+                            }
+                        ]
+                    },
+                )
+            if "/page-999/conversations" in url:
+                return _fake_resp(
+                    200,
+                    {
+                        "data": [
+                            {
+                                "id": "conv_unanswered",
+                                "participants": {"data": [{"id": "user-1", "username": "maria"}]},
+                                "messages": {
+                                    "data": [
+                                        {
+                                            "id": "mid_new",
+                                            "created_time": "2026-11-24T14:00:00+0000",
+                                            "from": {"id": "user-1", "username": "maria"},
+                                            "message": "Hola, ¿info del programa?",
+                                        }
+                                    ]
+                                },
+                            },
+                            {
+                                "id": "conv_answered",
+                                "participants": {"data": [{"id": "user-2", "username": "ana"}]},
+                                "messages": {
+                                    "data": [
+                                        {
+                                            "id": "mid_own",
+                                            "created_time": "2026-11-24T13:00:00+0000",
+                                            "from": {"id": "ig-123", "username": "nelhealthcoach"},
+                                            "message": "¡Claro! Te escribo.",
+                                        },
+                                        {
+                                            "id": "mid_old_user",
+                                            "created_time": "2026-11-24T12:00:00+0000",
+                                            "from": {"id": "user-2", "username": "ana"},
+                                            "message": "Pregunta ya respondida",
+                                        },
+                                    ]
+                                },
+                            },
+                        ]
+                    },
+                )
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(side_effect=_mock_get)
+        mock_client_cm = MagicMock()
+        mock_client_cm.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client_cm.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("meta_publisher.httpx.AsyncClient", return_value=mock_client_cm):
+            msgs, err = await fetch_instagram_dm_messages_with_status(
+                ig_user_id="ig-123",
+                access_token="user-tok",
+                since_minutes=4320,
+            )
+
+        self.assertIsNone(err)
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(msgs[0]["event_id"], "mid_new")
+        self.assertEqual(msgs[0]["sender_username"], "maria")
+
+
 if __name__ == "__main__":
     unittest.main()
