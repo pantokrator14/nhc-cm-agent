@@ -4,14 +4,19 @@ from __future__ import annotations
 
 import calendar
 import html as html_lib
+import io
 import json
 import logging
 import os
 import re
+import shutil
+import subprocess
 import tempfile
 import threading
 import time
 import unicodedata
+import xml.etree.ElementTree as ET
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
@@ -2885,13 +2890,59 @@ def _list_week_subfolders(service: Resource, stats_folder_id: str) -> list[tuple
     return weeks
 
 
+DOCX_MIME_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+PDF_MIME_TYPE = "application/pdf"
+
+
+def _extract_docx_text(raw_bytes: bytes) -> str:
+    """Extract readable paragraph text from a `.docx` file in memory."""
+    with zipfile.ZipFile(io.BytesIO(raw_bytes)) as zf:
+        xml_data = zf.read("word/document.xml")
+    root = ET.fromstring(xml_data)
+    ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    lines: list[str] = []
+    for paragraph in root.iter(f"{ns}p"):
+        text = "".join(node.text or "" for node in paragraph.iter(f"{ns}t")).strip()
+        if text:
+            lines.append(text)
+    return "\n".join(lines).strip()
+
+
+def _extract_pdf_text(raw_bytes: bytes) -> str:
+    """Extract text from PDF bytes using `pypdf` when available, with `pdftotext` fallback."""
+    try:
+        from pypdf import PdfReader
+
+        reader = PdfReader(io.BytesIO(raw_bytes))
+        pages_text = [(page.extract_text() or "").strip() for page in reader.pages]
+        joined = "\n\n".join(p for p in pages_text if p).strip()
+        if joined:
+            return joined
+    except Exception as pypdf_exc:
+        logger.debug("Extracción PDF con pypdf omitida/fallida: %s", pypdf_exc)
+
+    pdftotext_bin = shutil.which("pdftotext")
+    if pdftotext_bin:
+        proc = subprocess.run(
+            [pdftotext_bin, "-", "-"],
+            input=raw_bytes,
+            capture_output=True,
+            check=False,
+            timeout=30,
+        )
+        if proc.returncode == 0:
+            return proc.stdout.decode("utf-8", errors="replace").strip()
+
+    return ""
+
+
 def _read_reports_in_week_folder(
     service: Resource,
     week_folder_id: str,
     period_label: str,
     credentials_path: Path | str | None = None,
 ) -> list[dict[str, str]]:
-    """Export text of Google Docs / text files inside one `Semana N` folder, skipping images."""
+    """Export text of Google Docs, text, `.docx`, and `.pdf` reports inside one `Semana N` folder."""
     query = f"'{week_folder_id}' in parents and trashed = false"
     response = _execute_with_retry(
         service.files().list(
@@ -2910,12 +2961,23 @@ def _read_reports_in_week_folder(
     for item in response.get("files", []):
         mime_type = str(item.get("mimeType", "")).lower()
         name = str(item.get("name", ""))
+        lower_name = name.lower()
         is_doc = mime_type == GOOGLE_DOC_MIME_TYPE
-        is_text = mime_type.startswith("text/") or name.lower().endswith((".txt", ".md"))
-        if not (is_doc or is_text):
+        is_text = mime_type.startswith("text/") or lower_name.endswith((".txt", ".md"))
+        is_docx = mime_type == DOCX_MIME_TYPE or lower_name.endswith(".docx")
+        is_pdf = mime_type == PDF_MIME_TYPE or lower_name.endswith(".pdf")
+        if not (is_doc or is_text or is_docx or is_pdf):
             continue
         try:
-            text = get_guidelines_text(str(item["id"]), credentials_path=credentials_path)
+            file_id = str(item["id"])
+            if is_doc or is_text:
+                text = get_guidelines_text(file_id, credentials_path=credentials_path)
+            else:
+                raw_bytes: bytes = _execute_with_retry(
+                    service.files().get_media(fileId=file_id, supportsAllDrives=True),
+                    f"download_week_report({file_id})",
+                )
+                text = _extract_docx_text(raw_bytes) if is_docx else _extract_pdf_text(raw_bytes)
             if text.strip():
                 reports.append(
                     {
@@ -2924,8 +2986,10 @@ def _read_reports_in_week_folder(
                         "text": text.strip(),
                     }
                 )
+            else:
+                logger.warning("Informe previo '%s' (%s) no produjo texto legible.", name, file_id)
         except Exception as exc:
-            logger.debug("No se pudo leer informe '%s' (%s): %s", name, item.get("id"), exc)
+            logger.warning("No se pudo leer informe '%s' (%s): %s", name, item.get("id"), exc)
     return reports
 
 

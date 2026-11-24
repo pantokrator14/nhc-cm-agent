@@ -425,6 +425,56 @@ class TestDriveWeeksAndGuidelinesLogic(unittest.TestCase):
             self.assertEqual([it.entry.header for it in items], ["3. Flexibilidad"])
             self.assertTrue(items[0].is_overdue)
 
+    def test_read_reports_in_week_folder_supports_docx_and_pdf(self) -> None:
+        import io
+        import zipfile
+
+        docx_buf = io.BytesIO()
+        with zipfile.ZipFile(docx_buf, "w") as zf:
+            zf.writestr(
+                "word/document.xml",
+                (
+                    '<?xml version="1.0" encoding="UTF-8"?>'
+                    '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                    "<w:body><w:p><w:r><w:t>Resumen Semana 1</w:t></w:r></w:p>"
+                    "<w:p><w:r><w:t>Alcance: 2360</w:t></w:r></w:p></w:body></w:document>"
+                ),
+            )
+        docx_bytes = docx_buf.getvalue()
+
+        mock_drive = MagicMock()
+        mock_drive.files().list().execute.return_value = {
+            "files": [
+                {
+                    "id": "docx_1",
+                    "name": "Informe_S1.docx",
+                    "mimeType": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                },
+                {
+                    "id": "pdf_2",
+                    "name": "Informe_S2.pdf",
+                    "mimeType": "application/pdf",
+                },
+                {
+                    "id": "img_3",
+                    "name": "1.png",
+                    "mimeType": "image/png",
+                },
+            ]
+        }
+        mock_drive.files().get_media.return_value.execute.side_effect = [docx_bytes, b"%PDF-fake"]
+
+        with patch.object(drive_service, "_extract_pdf_text", return_value="Resumen Semana 2\nAlcance: 655"):
+            reports = drive_service._read_reports_in_week_folder(
+                mock_drive, "week_folder", "11/2026 - Semana 1"
+            )
+
+        self.assertEqual(len(reports), 2)
+        self.assertEqual(reports[0]["title"], "Informe_S1.docx")
+        self.assertIn("Alcance: 2360", reports[0]["text"])
+        self.assertEqual(reports[1]["title"], "Informe_S2.pdf")
+        self.assertIn("Alcance: 655", reports[1]["text"])
+
 
 if __name__ == "__main__":
     unittest.main()
