@@ -6,12 +6,14 @@ import asyncio
 import html
 import json
 import logging
+import re
 import shutil
 import subprocess
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -32,10 +34,15 @@ from telegram.ext import (
 from config import Settings
 from drive_service import (
     SPANISH_WEEKDAYS,
+    DriveOAuthExpiredError,
+    DriveServiceError,
+    DriveStorageQuotaError,
+    GoogleOAuthStatus,
     TempPublicLink,
     UnpublishedGuidelineItem,
     append_entry_to_monthly_doc,
     append_or_create_scripts_doc,
+    check_google_oauth_token_health,
     collect_previous_weekly_reports,
     compute_month_week_info,
     compute_next_numbering_and_filename,
@@ -84,6 +91,7 @@ from gemini_agent import (
     generate_trend_ideas,
     generate_video_script,
     generate_weekly_metrics_report,
+    is_story_filename,
     normalize_hashtags,
     revise_post_proposal,
 )
@@ -323,7 +331,10 @@ def _format_proposal_html(
     carousel_items = session.file_metadata.get("carousel_items") or []
     is_video = _is_video_metadata(session.file_metadata)
     media_type = html.escape(p.media_type)
-    category_label = "Pro Tip (Mar/Jue/Sáb)" if p.post_category == "PRO_TIP" else "Principal (Lun/Mié/Vie)"
+    if p.media_type == "STORIES":
+        category_label = "Historia IG (24h)"
+    else:
+        category_label = "Pro Tip (Mar/Jue/Sáb)" if p.post_category == "PRO_TIP" else "Principal (Lun/Mié/Vie)"
     short_title = html.escape(p.short_title) if p.short_title else "N/A"
     content_summary = html.escape(p.content_summary) if p.content_summary else "N/A"
     scheduled_time = html.escape(p.scheduled_time)
@@ -341,7 +352,9 @@ def _format_proposal_html(
         ads_badge = "⚪ Orgánico (no promocionar)"
     ads_detail = html.escape(p.ads_recommendation) if p.ads_recommendation else ""
 
-    if is_carousel:
+    if p.media_type == "STORIES":
+        tiktok_badge = "⚪ No aplica (las Historias de Instagram no se publican en TikTok)"
+    elif is_carousel:
         tiktok_badge = "⚪ No aplica (TikTok vía API solo admite videos MP4, no carruseles)"
     elif not is_video:
         tiktok_badge = "⚪ No aplica (TikTok vía API solo admite videos MP4)"
@@ -455,6 +468,8 @@ class NelHealthCoachBot:
         self.awaiting_ig_refine_by_chat: dict[int, str] = {}
         self.notified_meta_token_day: str = ""
         self.last_meta_token_status: MetaTokenStatus | None = None
+        self.notified_google_oauth_day: str = ""
+        self.last_google_oauth_status: GoogleOAuthStatus | None = None
 
     def _serialize_session(self, session: ProposalSession) -> dict[str, Any]:
         return {
@@ -572,6 +587,7 @@ class NelHealthCoachBot:
             show_tiktok_toggle=(
                 _is_video_metadata(session.file_metadata)
                 and not _is_carousel_metadata(session.file_metadata)
+                and session.proposal.media_type != "STORIES"
             ),
             publish_to_tiktok=session.proposal.publish_to_tiktok,
         )
@@ -633,6 +649,36 @@ class NelHealthCoachBot:
         if not sent and last_exc is not None:
             raise last_exc
         return sent
+
+    async def _broadcast_admin_document(
+        self,
+        document_bytes: bytes,
+        filename: str,
+        caption: str = "",
+    ) -> bool:
+        if self.application is None or not hasattr(self.application.bot, "send_document"):
+            return False
+        sent_any = False
+        for chat_id in self.settings.telegram_admin_chat_ids:
+            try:
+                bio = BytesIO(document_bytes)
+                bio.name = filename
+                await self.application.bot.send_document(
+                    chat_id=chat_id,
+                    document=bio,
+                    filename=filename,
+                    caption=caption[:1024] if caption else None,
+                    parse_mode=ParseMode.HTML if caption else None,
+                )
+                sent_any = True
+            except Exception as exc:
+                logger.warning(
+                    "No se pudo enviar documento '%s' a chat_id=%s: %s",
+                    filename,
+                    chat_id,
+                    exc,
+                )
+        return sent_any
 
     async def _send_admin_message(
         self,
@@ -786,8 +832,15 @@ class NelHealthCoachBot:
         file_name = str(drive_file.get("name", entry.header))
         mime_type = str(drive_file.get("mimeType", "")).lower()
         is_video = mime_type.startswith("video/") or file_name.lower().endswith(".mp4")
-        media_type = "REELS" if is_video else "IMAGE"
-        clean_hashtags = normalize_hashtags(entry.hashtags, max_count=MAX_INSTAGRAM_HASHTAGS)
+        is_story = is_story_filename(file_name) or bool(
+            re.match(r"^historia\b", entry.header.strip(), re.IGNORECASE)
+        )
+        media_type = "STORIES" if is_story else ("REELS" if is_video else "IMAGE")
+        clean_hashtags = (
+            ""
+            if is_story
+            else normalize_hashtags(entry.hashtags, max_count=MAX_INSTAGRAM_HASHTAGS)
+        )
 
         proposal = PostProposal(
             content_summary=f"Pauta existente del documento: {entry.header}",
@@ -809,7 +862,7 @@ class NelHealthCoachBot:
             keyword=entry.keyword,
             target_link=entry.target_link,
             public_reply_text="",
-            publish_to_tiktok=is_video,
+            publish_to_tiktok=is_video and not is_story,
             tiktok_caption=entry.caption or entry.hook_title or entry.short_title,
         )
         proposal_id = uuid.uuid4().hex[:10]
@@ -1318,6 +1371,7 @@ class NelHealthCoachBot:
                 original_filename=old_name,
                 credentials_path=creds,
                 is_carousel=_is_carousel_metadata(session.file_metadata),
+                is_story=(p.media_type == "STORIES"),
             )
 
         if doc_meta:
@@ -2390,6 +2444,7 @@ class NelHealthCoachBot:
         )
 
         doc_url = ""
+        drive_warning = ""
         if month_folder_id:
             cat_str = "Pro Tip (Mar/Jue/Sáb)" if script.format_type == "PRO_TIP" else "Principal a cámara (Lun/Mié/Vie)"
             script_lines = [
@@ -2403,14 +2458,18 @@ class NelHealthCoachBot:
                 f"Caption: {script.caption}",
                 f"Hashtags: {script.hashtags}",
             ]
-            doc_id, _ = await asyncio.to_thread(
-                append_or_create_scripts_doc,
-                month_folder_id,
-                script_lines,
-                "Guiones",
-                creds,
-            )
-            doc_url = f"https://docs.google.com/document/d/{doc_id}/edit"
+            try:
+                doc_id, _ = await asyncio.to_thread(
+                    append_or_create_scripts_doc,
+                    month_folder_id,
+                    script_lines,
+                    "Guiones",
+                    creds,
+                )
+                doc_url = f"https://docs.google.com/document/d/{doc_id}/edit"
+            except DriveServiceError as drive_exc:
+                logger.warning("No se pudo guardar guion en Google Docs: %s", drive_exc)
+                drive_warning = str(drive_exc)
 
         tag_count = len(script.hashtags.split())
         msg_lines = [
@@ -2427,6 +2486,11 @@ class NelHealthCoachBot:
         ]
         if doc_url:
             msg_lines.append(f"\n📄 <a href=\"{doc_url}\">Abrir documento Guiones en Drive ({year_str}/{month_str})</a>")
+        elif drive_warning:
+            msg_lines.append(
+                f"\n⚠️ <b>No se pudo guardar automáticamente en Google Docs 'Guiones':</b>\n"
+                f"<i>{html.escape(drive_warning)}</i>"
+            )
         await self._send_long_html_message("\n".join(msg_lines))
 
     async def _handle_script_from_idea(self, reply_target: Any, idx_str: str) -> None:
@@ -2570,25 +2634,6 @@ class NelHealthCoachBot:
             week_num == 1,
         )
 
-        doc_id, created = await asyncio.to_thread(
-            create_or_update_google_doc,
-            week_folder_id,
-            report_title,
-            report.report_document_text,
-            (
-                "Resumen",
-                "RESUMEN MENSUAL",
-                "Análisis",
-                "Cuenta:",
-                "Publicaciones:",
-                "Meta Ads:",
-                "TikTok:",
-                "Ganadores:",
-                "Recomendaciones:",
-            ),
-            creds,
-        )
-
         await asyncio.to_thread(
             save_performance_memory,
             {
@@ -2599,14 +2644,70 @@ class NelHealthCoachBot:
             self.settings.state_file_path,
         )
 
-        doc_url = f"https://docs.google.com/document/d/{doc_id}/edit"
         folder_url = f"https://drive.google.com/drive/folders/{week_folder_id}"
-        verb = "creado" if created else "actualizado"
         extra_note = (
             f"\n📅 <i>Incluye Resumen Mensual Consolidado de {month_label}.</i>"
             if is_month_end
             else ""
         )
+
+        try:
+            doc_id, created = await asyncio.to_thread(
+                create_or_update_google_doc,
+                week_folder_id,
+                report_title,
+                report.report_document_text,
+                (
+                    "Resumen",
+                    "RESUMEN MENSUAL",
+                    "Análisis",
+                    "Cuenta:",
+                    "Publicaciones:",
+                    "Meta Ads:",
+                    "TikTok:",
+                    "Ganadores:",
+                    "Recomendaciones:",
+                ),
+                creds,
+            )
+        except DriveServiceError as drive_exc:
+            logger.warning(
+                "Informe semanal generado pero no pudo crearse en Google Docs (%s): %s",
+                week_folder_id,
+                drive_exc,
+            )
+            safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", report_title).strip("_") or "informe_semanal"
+            doc_sent = await self._broadcast_admin_document(
+                document_bytes=report.report_document_text.encode("utf-8"),
+                filename=f"{safe_name}.txt",
+                caption=f"📊 <b>{html.escape(report_title)}</b> (respaldo local por error de Drive)",
+            )
+            quota_note = (
+                "La Service Account de Google Drive no tiene cuota para crear archivos nuevos en carpetas personales."
+                if isinstance(drive_exc, DriveStorageQuotaError)
+                else str(drive_exc)
+            )
+            msg_parts = [
+                f"📊 <b>Informe Semanal de Métricas generado (sin guardar en Google Docs)</b>",
+                f"📄 <b>Título:</b> <code>{html.escape(report_title)}</code>",
+                f"📁 <b>Carpeta destino:</b> <code>{year_str}/{month_str}/Estadísticas/Semana {week_num}</code>{extra_note}",
+                f"⚠️ <b>Motivo en Drive:</b> {html.escape(quota_note)}",
+                f"📝 <b>Resumen ejecutivo:</b>\n{html.escape(report.executive_summary)}",
+                f"📂 <a href=\"{folder_url}\">Abrir carpeta Semana {week_num}</a>",
+                f"ℹ️ <i>{html.escape(str(drive_exc))}</i>",
+            ]
+            if not doc_sent:
+                msg_parts.append("📄 <b>Informe completo:</b>")
+                raw_text = report.report_document_text.strip()
+                step = 3200
+                for start in range(0, len(raw_text), step):
+                    chunk_plain = raw_text[start : start + step]
+                    msg_parts.append(f"<pre>{html.escape(chunk_plain)}</pre>")
+            await self._send_long_html_message("\n\n".join(msg_parts))
+            return
+
+        doc_url = f"https://docs.google.com/document/d/{doc_id}/edit"
+        verb = "creado" if created else "actualizado"
         await self._send_admin_message(
             f"📊 <b>Informe Semanal de Métricas {verb}</b>\n\n"
             f"📄 <b>Documento:</b> <code>{html.escape(report_title)}</code>\n"
@@ -3282,6 +3383,63 @@ class NelHealthCoachBot:
             self.notified_meta_token_day = today_key
         return status
 
+    async def check_google_oauth_health(self, *, notify_always: bool = False) -> GoogleOAuthStatus:
+        """Check Google OAuth user token validity/age and remind admins before 7-day Testing expiry."""
+        status = await asyncio.to_thread(
+            check_google_oauth_token_health,
+            self.settings.google_application_credentials,
+            self.settings.google_oauth_credentials,
+            5.0,
+        )
+        self.last_google_oauth_status = status
+        today_key = self._get_reference_now().strftime("%Y-%m-%d")
+
+        if not status.enabled:
+            if notify_always:
+                await self._send_admin_message(
+                    "📁 <b>Google Drive Auth:</b> usando <code>Service Account</code> "
+                    "(sin <code>GOOGLE_OAUTH_CREDENTIALS</code> configurado)."
+                )
+            return status
+
+        should_alert = (not status.is_valid) or status.needs_renewal or notify_always
+        if should_alert and (notify_always or self.notified_google_oauth_day != today_key):
+            if not status.is_valid:
+                header = "🚨 <b>ALERTA: Token OAuth de Google Drive expirado/inválido</b>"
+            elif status.needs_renewal:
+                rem = status.days_until_7d_expiry if status.days_until_7d_expiry is not None else "?"
+                header = f"⚠️ <b>RECORDATORIO: Renovar OAuth de Google Drive (quedan ~{rem} día(s) del límite de 7 días en modo Prueba)</b>"
+            else:
+                header = "📁 <b>Estado de Google Drive OAuth</b>"
+
+            age_str = f"{status.age_days:.1f} días" if status.age_days is not None else "N/D"
+            rem_str = (
+                f"~{status.days_until_7d_expiry} día(s) (si la app sigue en modo Prueba)"
+                if status.days_until_7d_expiry is not None
+                else "N/D"
+            )
+            steps = (
+                "\n\n<b>Pasos para renovar (2 minutos):</b>\n"
+                "1. En tu PC ejecuta:\n"
+                "   <code>.venv/bin/python scripts/google_oauth_setup.py</code>\n"
+                "2. Abre la URL y autoriza con <code>ceo@nelhealthcoach.com</code>.\n"
+                "3. Sube el archivo nuevo al servidor DigitalOcean:\n"
+                "   <code>scp credentials/oauth_token.json root@TU_IP:/root/nhc-cm-agent/credentials/oauth_token.json</code>\n"
+                "4. Reinicia el servicio en el servidor:\n"
+                "   <code>ssh root@TU_IP \"systemctl restart nel-agent\"</code>"
+            )
+            msg = (
+                f"{header}\n\n"
+                f"• <b>Estado:</b> {'Válido ✅' if status.is_valid else 'Expirado/Inválido ❌'}\n"
+                f"• <b>Antigüedad:</b> {html.escape(age_str)}\n"
+                f"• <b>Vigencia estimada (Testing):</b> {html.escape(rem_str)}\n"
+                f"• <b>Detalle:</b> {html.escape(status.message)}"
+                f"{steps if (not status.is_valid or status.needs_renewal or notify_always) else ''}"
+            )
+            await self._send_admin_message(msg)
+            self.notified_google_oauth_day = today_key
+        return status
+
     async def cmd_id(
         self,
         update: Update,
@@ -3309,12 +3467,13 @@ class NelHealthCoachBot:
         if not self._is_authorized_admin(update):
             return
 
-        await update.effective_message.reply_text("🔐 Verificando estado del META_ACCESS_TOKEN...")
+        await update.effective_message.reply_text("🔐 Verificando estado de META_ACCESS_TOKEN y Google Drive OAuth...")
         try:
             await self.check_meta_token_health(notify_always=True)
+            await self.check_google_oauth_health(notify_always=True)
         except Exception as exc:
             logger.exception("Error ejecutando /token: %s", exc)
-            await self.notify_error(f"Error consultando estado de META_ACCESS_TOKEN: {exc}")
+            await self.notify_error(f"Error consultando estado de credenciales: {exc}")
 
     async def cmd_status(
         self,

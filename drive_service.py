@@ -19,6 +19,9 @@ from typing import Any, Literal, NamedTuple
 
 import google_auth_httplib2
 import httplib2
+from google.auth.exceptions import RefreshError
+from google.auth.transport.requests import Request as GoogleAuthRequest
+from google.oauth2 import credentials as oauth2_credentials
 from google.oauth2 import service_account
 from googleapiclient.discovery import Resource, build
 from googleapiclient.errors import HttpError
@@ -64,6 +67,27 @@ class DriveServiceError(RuntimeError):
     """Raised when a Google Drive API or state operation fails."""
 
 
+class DriveStorageQuotaError(DriveServiceError):
+    """Raised when a Service Account lacks Drive storage quota to create a new file."""
+
+
+class DriveOAuthExpiredError(DriveServiceError):
+    """Raised when Google OAuth user credentials expired or were revoked (e.g. 7-day Testing mode)."""
+
+
+@dataclass(frozen=True, slots=True)
+class GoogleOAuthStatus:
+    """Health status for Google OAuth 2.0 user credentials (`oauth_token.json`)."""
+
+    enabled: bool
+    is_valid: bool
+    age_days: float | None = None
+    days_until_7d_expiry: int | None = None
+    needs_renewal: bool = False
+    token_path: str = ""
+    message: str = ""
+
+
 class TempPublicLink(NamedTuple):
     """Temporary public download link and its Drive permission identifier."""
 
@@ -85,6 +109,16 @@ def _get_state_path(state_path: Path | str | None = None) -> Path:
 
 
 def _resolve_credentials_path(credentials_path: Path | str | None = None) -> Path:
+    if credentials_path is None:
+        oauth_env = os.getenv("GOOGLE_OAUTH_CREDENTIALS", "").strip()
+        if oauth_env:
+            oauth_path = resolve_project_path(oauth_env)
+            if not oauth_path.is_file():
+                raise DriveServiceError(
+                    f"Archivo OAuth de Google no encontrado: {oauth_path}"
+                )
+            return oauth_path
+
     raw_creds = (
         str(credentials_path)
         if credentials_path is not None
@@ -105,15 +139,99 @@ def _get_service_account_email(creds_path: Path) -> str:
         return ""
 
 
+def _is_authorized_user_json(path: Path) -> bool:
+    try:
+        raw_data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(raw_data, dict) and (
+        raw_data.get("type") == "authorized_user"
+        or (
+            "refresh_token" in raw_data
+            and "client_id" in raw_data
+            and "client_secret" in raw_data
+            and raw_data.get("type") != "service_account"
+        )
+    )
+
+
+def _load_google_credentials(
+    scopes: list[str],
+    credentials_path: Path | str | None = None,
+) -> Any:
+    """Load Service Account (with optional Workspace impersonation) or User OAuth2 credentials."""
+    creds_path = _resolve_credentials_path(credentials_path)
+    if _is_authorized_user_json(creds_path):
+        return oauth2_credentials.Credentials.from_authorized_user_file(
+            str(creds_path),
+            scopes=scopes,
+        )
+
+    oauth_env = os.getenv("GOOGLE_OAUTH_CREDENTIALS", "").strip()
+    if oauth_env:
+        oauth_path = resolve_project_path(oauth_env)
+        if not oauth_path.is_file():
+            raise DriveServiceError(
+                f"Archivo OAuth de Google no encontrado: {oauth_path}"
+            )
+        return oauth2_credentials.Credentials.from_authorized_user_file(
+            str(oauth_path),
+            scopes=scopes,
+        )
+
+    impersonate_email = os.getenv("GOOGLE_DRIVE_IMPERSONATE_EMAIL", "").strip()
+    if impersonate_email:
+        return service_account.Credentials.from_service_account_file(
+            str(creds_path),
+            scopes=scopes,
+            subject=impersonate_email,
+        )
+    return service_account.Credentials.from_service_account_file(
+        str(creds_path),
+        scopes=scopes,
+    )
+
+
+def _is_storage_quota_error(exc: HttpError) -> bool:
+    status = getattr(getattr(exc, "resp", None), "status", None)
+    if status != 403:
+        return False
+    raw_content = getattr(exc, "content", b"") or b""
+    content_text = (
+        raw_content.decode("utf-8", errors="ignore")
+        if isinstance(raw_content, (bytes, bytearray))
+        else str(raw_content)
+    )
+    combined = f"{exc} {content_text}".lower()
+    return (
+        "storagequotaexceeded" in combined
+        or "service accounts do not have storage quota" in combined
+    )
+
+
+def _format_storage_quota_message(
+    doc_title: str,
+    folder_id: str,
+    sa_email: str,
+) -> str:
+    sa_label = sa_email or "la Service Account"
+    return (
+        f"No se pudo crear el documento '{doc_title}' en Google Drive (carpeta {folder_id}) "
+        f"porque {sa_label} no tiene cuota de almacenamiento propia (HTTP 403 storageQuotaExceeded).\n\n"
+        "Soluciones permanentes (elige una):\n"
+        "1) Mover la carpeta raíz a una Unidad Compartida (Shared Drive) y dar rol Gestor de contenido a la Service Account.\n"
+        "2) Activar Domain-Wide Delegation en Google Workspace y configurar GOOGLE_DRIVE_IMPERSONATE_EMAIL (ej. ceo@nelhealthcoach.com).\n"
+        "3) Configurar credenciales OAuth 2.0 de usuario en GOOGLE_OAUTH_CREDENTIALS.\n\n"
+        f"Solución rápida para esta carpeta: crea manualmente un Google Doc vacío llamado '{doc_title}' "
+        f"dentro de la carpeta {folder_id} y vuelve a ejecutar el comando para que el agente lo rellene."
+    )
+
+
 DRIVE_HTTP_TIMEOUT_SECONDS = 60
 
 
 def _get_drive_client(credentials_path: Path | str | None = None) -> Resource:
-    creds_path = _resolve_credentials_path(credentials_path)
-    credentials = service_account.Credentials.from_service_account_file(
-        str(creds_path),
-        scopes=DRIVE_SCOPES,
-    )
+    credentials = _load_google_credentials(DRIVE_SCOPES, credentials_path)
     authorized_http = google_auth_httplib2.AuthorizedHttp(
         credentials,
         http=httplib2.Http(timeout=DRIVE_HTTP_TIMEOUT_SECONDS),
@@ -122,16 +240,113 @@ def _get_drive_client(credentials_path: Path | str | None = None) -> Resource:
 
 
 def _get_docs_client(credentials_path: Path | str | None = None) -> Resource:
-    creds_path = _resolve_credentials_path(credentials_path)
-    credentials = service_account.Credentials.from_service_account_file(
-        str(creds_path),
-        scopes=DOCS_SCOPES,
-    )
+    credentials = _load_google_credentials(DOCS_SCOPES, credentials_path)
     authorized_http = google_auth_httplib2.AuthorizedHttp(
         credentials,
         http=httplib2.Http(timeout=DRIVE_HTTP_TIMEOUT_SECONDS),
     )
     return build("docs", "v1", http=authorized_http, cache_discovery=False)
+
+
+def check_google_oauth_token_health(
+    credentials_path: Path | str | None = None,
+    oauth_credentials_path: Path | str | None = None,
+    warn_age_days: float = 5.0,
+) -> GoogleOAuthStatus:
+    """Validate Google OAuth `authorized_user` token and report age for 7-day Testing renewal alerts."""
+    target_path: Path | None = None
+    if oauth_credentials_path:
+        p = resolve_project_path(oauth_credentials_path)
+        if p.is_file():
+            target_path = p
+    if target_path is None:
+        oauth_env = os.getenv("GOOGLE_OAUTH_CREDENTIALS", "").strip()
+        if oauth_env:
+            p = resolve_project_path(oauth_env)
+            if p.is_file():
+                target_path = p
+            else:
+                return GoogleOAuthStatus(
+                    enabled=True,
+                    is_valid=False,
+                    needs_renewal=True,
+                    token_path=str(p),
+                    message=f"Archivo GOOGLE_OAUTH_CREDENTIALS no encontrado: {p}",
+                )
+    if target_path is None and credentials_path is not None:
+        p = resolve_project_path(credentials_path)
+        if p.is_file() and _is_authorized_user_json(p):
+            target_path = p
+
+    if target_path is None:
+        return GoogleOAuthStatus(
+            enabled=False,
+            is_valid=True,
+            message="Usando Service Account (sin OAuth de usuario).",
+        )
+
+    if not _is_authorized_user_json(target_path):
+        return GoogleOAuthStatus(
+            enabled=True,
+            is_valid=False,
+            needs_renewal=True,
+            token_path=str(target_path),
+            message=f"El archivo '{target_path}' no tiene formato válido authorized_user.",
+        )
+
+    age_days: float | None = None
+    days_until_7d: int | None = None
+    try:
+        raw = json.loads(target_path.read_text(encoding="utf-8"))
+        created_raw = str(raw.get("created_at", "")).strip()
+        if created_raw:
+            created_dt = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+        else:
+            created_dt = datetime.fromtimestamp(target_path.stat().st_mtime, tz=timezone.utc)
+        if created_dt.tzinfo is None:
+            created_dt = created_dt.replace(tzinfo=timezone.utc)
+        age_days = max(0.0, (datetime.now(timezone.utc) - created_dt).total_seconds() / 86400.0)
+        days_until_7d = max(0, int(7 - age_days))
+    except Exception:
+        pass
+
+    try:
+        creds = oauth2_credentials.Credentials.from_authorized_user_file(
+            str(target_path),
+            scopes=DOCS_SCOPES,
+        )
+        creds.refresh(GoogleAuthRequest())
+    except RefreshError as exc:
+        return GoogleOAuthStatus(
+            enabled=True,
+            is_valid=False,
+            age_days=age_days,
+            days_until_7d_expiry=0,
+            needs_renewal=True,
+            token_path=str(target_path),
+            message=f"Token OAuth expirado o revocado ({exc}).",
+        )
+    except Exception as exc:
+        return GoogleOAuthStatus(
+            enabled=True,
+            is_valid=True,
+            age_days=age_days,
+            days_until_7d_expiry=days_until_7d,
+            needs_renewal=bool(age_days is not None and age_days >= warn_age_days),
+            token_path=str(target_path),
+            message=f"No se pudo verificar refresh en vivo ({exc}).",
+        )
+
+    needs_renewal = bool(age_days is not None and age_days >= warn_age_days)
+    return GoogleOAuthStatus(
+        enabled=True,
+        is_valid=True,
+        age_days=age_days,
+        days_until_7d_expiry=days_until_7d,
+        needs_renewal=needs_renewal,
+        token_path=str(target_path),
+        message="Token OAuth de Google activo y válido.",
+    )
 
 
 def _execute_with_retry(
@@ -143,6 +358,11 @@ def _execute_with_retry(
     for attempt in range(1, max_attempts + 1):
         try:
             return request.execute(num_retries=2)
+        except RefreshError as exc:
+            raise DriveOAuthExpiredError(
+                f"El token OAuth de Google Drive expiró o fue revocado en '{action_name}': {exc}. "
+                "Renuévalo con: .venv/bin/python scripts/google_oauth_setup.py"
+            ) from exc
         except (TimeoutError, OSError, httplib2.HttpLib2Error) as exc:
             if attempt >= max_attempts:
                 raise DriveServiceError(
@@ -781,7 +1001,7 @@ def get_guidelines_text(
             )
         else:
             content_bytes = _execute_with_retry(
-                service.files().get_media(fileId=doc_id),
+                service.files().get_media(fileId=doc_id, supportsAllDrives=True),
                 f"download_guidelines({doc_id})",
             )
 
@@ -1247,6 +1467,15 @@ def create_monthly_guidelines_doc(
         )
         return doc_id
     except HttpError as exc:
+        if _is_storage_quota_error(exc):
+            sa_email = ""
+            try:
+                sa_email = _get_service_account_email(_resolve_credentials_path(credentials_path))
+            except Exception:
+                pass
+            raise DriveStorageQuotaError(
+                _format_storage_quota_message(doc_title, month_folder_id, sa_email)
+            ) from exc
         raise DriveServiceError(
             f"Error creando el documento '{doc_title}' en carpeta {month_folder_id}: {exc}"
         ) from exc
@@ -1260,6 +1489,7 @@ def compute_next_numbering_and_filename(
     original_filename: str,
     credentials_path: Path | str | None = None,
     is_carousel: bool = False,
+    is_story: bool = False,
 ) -> tuple[str, str]:
     """Compute the next sequential doc header and Drive filename (`NN. Title.ext`)."""
     service = _get_drive_client(credentials_path)
@@ -1302,6 +1532,7 @@ def compute_next_numbering_and_filename(
 
     max_main_num = 0
     max_protip_num = 0
+    max_story_num = 0
     for line in guidelines_text.splitlines():
         stripped = line.strip()
         m_main = re.match(r"^(\d+)\.\s+\S+", stripped)
@@ -1310,13 +1541,21 @@ def compute_next_numbering_and_filename(
         m_protip = re.match(r"^Pro\s*Tip\s+(\d+)\s*:", stripped, flags=re.IGNORECASE)
         if m_protip:
             max_protip_num = max(max_protip_num, int(m_protip.group(1)))
+        m_story = re.match(r"^Historia\s+(\d+)\s*:", stripped, flags=re.IGNORECASE)
+        if m_story:
+            max_story_num = max(max_story_num, int(m_story.group(1)))
 
     raw_title = re.sub(r"^\(CARRUSEL\)\s*", "", short_title, flags=re.IGNORECASE)
+    if is_story:
+        raw_title = re.sub(r"^(?:[\(\[]\s*)?(?:historias?|story|stories)(?:\s*[\)\]])?[\s._\-:]*", "", raw_title, flags=re.IGNORECASE)
     clean_title = re.sub(r'[\\/:*?"<>|]+', "", raw_title).strip()[:60] or "Publicación"
     ext = "" if is_carousel else (Path(original_filename).suffix or ".mp4")
     carousel_tag = "(CARRUSEL) " if is_carousel else ""
 
-    if post_category.upper() == "PRO_TIP":
+    if is_story:
+        doc_header = f"Historia {max_story_num + 1}: {clean_title}"
+        new_filename = f"{next_drive_num:02d}. Historia {clean_title}{ext}"
+    elif post_category.upper() == "PRO_TIP":
         doc_header = f"Pro Tip {max_protip_num + 1}: {clean_title}"
         new_filename = f"{next_drive_num:02d}. Pro tip {carousel_tag}{clean_title}{ext}"
     else:
@@ -1582,6 +1821,9 @@ def _match_entry_header(line: str) -> tuple[Literal["MAIN", "PRO_TIP"], str] | N
     m_protip = re.match(r"^Pro\s*Tip\s+\d+\s*:\s*(.+)$", stripped, flags=re.IGNORECASE)
     if m_protip:
         return "PRO_TIP", _strip_published_marker(m_protip.group(1).strip())
+    m_story = re.match(r"^Historia\s+\d+\s*:\s*(.+)$", stripped, flags=re.IGNORECASE)
+    if m_story:
+        return "PRO_TIP", _strip_published_marker(m_story.group(1).strip())
     m_main = re.match(r"^\d+\.\s+(.+)$", stripped)
     if m_main:
         title = _strip_published_marker(m_main.group(1).strip())
@@ -1761,7 +2003,7 @@ def parse_guidelines_entries(
 def _stem_tokens(text: str) -> set[str]:
     norm = _normalize_match_text(text)
     norm = re.sub(r"^\d+[\.\-\s:]*", "", norm)
-    norm = re.sub(r"\b(pro\s*tip|protip|video|mp4|jpg|jpeg|png)\b", " ", norm)
+    norm = re.sub(r"\b(pro\s*tip|protip|historias?|story|stories|video|mp4|jpg|jpeg|png)\b", " ", norm)
     tokens = {tok for tok in re.findall(r"[a-z0-9]{3,}", norm)}
     return tokens
 
@@ -2376,6 +2618,49 @@ def _find_doc_by_title_ci(
     return None
 
 
+def _replace_google_doc_text_via_docs_api(
+    doc_id: str,
+    plain_text_content: str,
+    credentials_path: Path | str | None = None,
+) -> None:
+    docs_service = _get_docs_client(credentials_path)
+    doc = _execute_with_retry(
+        docs_service.documents().get(documentId=doc_id),
+        f"docs_get_replace({doc_id})",
+    )
+    content = doc.get("body", {}).get("content", [])
+    doc_end_index = content[-1].get("endIndex", 1) if content else 1
+    requests: list[dict[str, Any]] = []
+    if doc_end_index > 2:
+        requests.append(
+            {
+                "deleteContentRange": {
+                    "range": {
+                        "startIndex": 1,
+                        "endIndex": doc_end_index - 1,
+                    }
+                }
+            }
+        )
+    if plain_text_content:
+        requests.append(
+            {
+                "insertText": {
+                    "location": {"index": 1},
+                    "text": plain_text_content,
+                }
+            }
+        )
+    if requests:
+        _execute_with_retry(
+            docs_service.documents().batchUpdate(
+                documentId=doc_id,
+                body={"requests": requests},
+            ),
+            f"docs_replace_all({doc_id})",
+        )
+
+
 def create_or_update_google_doc(
     folder_id: str,
     doc_title: str,
@@ -2397,15 +2682,29 @@ def create_or_update_google_doc(
             resumable=False,
         )
         if existing_id:
-            _execute_with_retry(
-                service.files().update(
-                    fileId=existing_id,
-                    media_body=media,
-                    fields="id, name",
-                    supportsAllDrives=True,
-                ),
-                f"update_google_doc({existing_id})",
-            )
+            try:
+                _execute_with_retry(
+                    service.files().update(
+                        fileId=existing_id,
+                        media_body=media,
+                        fields="id, name",
+                        supportsAllDrives=True,
+                    ),
+                    f"update_google_doc({existing_id})",
+                )
+            except HttpError as update_exc:
+                if getattr(getattr(update_exc, "resp", None), "status", None) not in {403, 404}:
+                    raise
+                logger.warning(
+                    "Drive HTML update rechazado (%s) para doc %s; usando Google Docs API.",
+                    update_exc.resp.status,
+                    existing_id,
+                )
+                _replace_google_doc_text_via_docs_api(
+                    existing_id,
+                    plain_text_content,
+                    credentials_path=credentials_path,
+                )
             logger.info("Documento '%s' actualizado en Drive (id=%s).", doc_title, existing_id)
             return existing_id, False
 
@@ -2426,6 +2725,15 @@ def create_or_update_google_doc(
         logger.info("Documento '%s' creado en Drive (id=%s, folder=%s).", doc_title, new_id, folder_id)
         return new_id, True
     except HttpError as exc:
+        if _is_storage_quota_error(exc):
+            sa_email = ""
+            try:
+                sa_email = _get_service_account_email(_resolve_credentials_path(credentials_path))
+            except Exception:
+                pass
+            raise DriveStorageQuotaError(
+                _format_storage_quota_message(doc_title, folder_id, sa_email)
+            ) from exc
         raise DriveServiceError(
             f"Error creando/actualizando documento '{doc_title}' en carpeta {folder_id}: {exc}"
         ) from exc

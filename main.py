@@ -367,6 +367,10 @@ async def run_agent(settings: Settings) -> None:
                 await bot_controller.check_meta_token_health()
             except Exception as tok_exc:
                 logger.warning("No se pudo verificar estado de META_ACCESS_TOKEN: %s", tok_exc)
+            try:
+                await bot_controller.check_google_oauth_health()
+            except Exception as goauth_exc:
+                logger.warning("No se pudo verificar estado de Google OAuth: %s", goauth_exc)
 
         async def scheduled_ig_dm_poll() -> None:
             try:

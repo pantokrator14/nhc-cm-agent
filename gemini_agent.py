@@ -8,6 +8,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
@@ -40,7 +41,8 @@ Reglas estrictas de emparejamiento:
    - `13. PROTIP estoesecono/cost.mp4` -> `Pro Tip 6: Lo económico vs. lo costoso`
    - `14. Orinar.mp4` -> `8. Orinar`
 3. Marca `already_in_guidelines = true` para TODO archivo que ya tenga una entrada equivalente en el documento de pautas (por número, título, tema o Pro Tip).
-4. Marca `already_in_guidelines = false` ÚNICAMENTE para archivos nuevos cuyo tema/nombre NO aparece en la lista del documento.
+4. **EXCEPCIÓN IMPORTANTE DE HISTORIAS**: Si el archivo es una Historia (`historia ...`, `story ...`, `(HISTORIA)`), **NO** lo emparejes con un Reel o Pro Tip existente aunque compartan tema (por ejemplo, `historia ORINAR.mp4` NO es `8. Orinar`); solo marca `already_in_guidelines = true` si en el documento existe explícitamente una entrada de Historia (`Historia N: ...`) equivalente.
+5. Marca `already_in_guidelines = false` ÚNICAMENTE para archivos nuevos cuyo tema/nombre NO aparece en la lista del documento.
 """
 
 PROPOSAL_SYSTEM_INSTRUCTION = """Eres el Director de Contenido, Estratega de Redes y Trafficker de "Nel Health Coach" (@nelhealthcoach).
@@ -51,8 +53,11 @@ Analizar DIRECTAMENTE el archivo multimedia (video o imagen) junto con el docume
 Reglas editoriales y estratégicas obligatorias:
 1. Análisis real del archivo y regla ESTRICTA de `MAIN` vs `PRO_TIP`:
    - Observa/escucha el contenido real del video o imagen (tema exacto, formato visual, si aparece una persona hablando a cámara o si es solo texto/imágenes estáticas).
-   - **REGLA CRÍTICA DE CLASIFICACIÓN**:
-     * **Video grabado por Manuel Martínez (persona hablando a cámara / presentador)**: `has_presenter_on_camera = true` -> **SIEMPRE** es `post_category = "MAIN"`, formato `"REELS"`, sin importar que dure pocos segundos. **NUNCA** clasifiques un video grabado por Manuel hablando a cámara como `PRO_TIP`.
+   - **REGLA CRÍTICA DE HISTORIAS vs REELS/FEED**:
+     * Si el nombre del archivo indica que es una Historia (por ejemplo empieza por `historia ...`, `historias ...`, `story ...`, `stories ...`, `(HISTORIA)` o `[HISTORIA]`), es **OBLIGATORIAMENTE `media_type = "STORIES"`** (Historia de Instagram de 24 horas), **NUNCA `"REELS"`**, aunque Manuel aparezca hablando a cámara.
+     * Para `"STORIES"`: `promote_in_ads = false`, `publish_to_tiktok = false`, `hashtags = ""` y redacta en `caption` un texto breve/nota de sticker o contexto para la historia (no un caption largo de Reel).
+   - **REGLA CRÍTICA DE CLASIFICACIÓN (`MAIN` vs `PRO_TIP`)**:
+     * **Video grabado por Manuel Martínez (persona hablando a cámara / presentador)**: `has_presenter_on_camera = true` -> **SIEMPRE** es `post_category = "MAIN"`, y si NO es una Historia (`STORIES`), su formato es `"REELS"`, sin importar que dure pocos segundos. **NUNCA** clasifiques un video grabado por Manuel hablando a cámara como `PRO_TIP`.
      * **Pro Tips (`post_category = "PRO_TIP"`)**: **SOLO** pueden ser (a) videos cortos sin persona hablando a cámara hechos con textos e imágenes estáticas que cambian automáticamente como un carrusel/presentación, o (b) imágenes de texto en formato vertical (para `"STORIES"` o `"IMAGE"`). En ambos casos `has_presenter_on_camera = false`.
    - Resume brevemente lo que trata el archivo en `content_summary`.
 2. Cadencia semanal obligatoria (NO copies ciegamente las horas viejas; razona el mejor día y horario según el contenido):
@@ -395,12 +400,37 @@ def _is_video_file(file_metadata: dict[str, Any]) -> bool:
     return mime_type.startswith("video/") or Path(name).suffix == ".mp4"
 
 
+_STORY_FILENAME_RE = re.compile(
+    r"^(?:\d+\s*[\.\-\)]\s*)?(?:[\(\[]\s*)?(?:historias?|story|stories)(?:\s*[\)\]])?(?:[\s._\-:]+|$)",
+    re.IGNORECASE,
+)
+
+
+def is_story_filename(filename: str) -> bool:
+    """Return True when a Drive filename explicitly marks the asset as an Instagram Story."""
+    stem = Path(filename.strip()).stem
+    decomposed = unicodedata.normalize("NFKD", stem)
+    ascii_stem = "".join(ch for ch in decomposed if not unicodedata.combining(ch)).lower().strip()
+    return bool(_STORY_FILENAME_RE.match(ascii_stem))
+
+
 def _normalize_media_type(
     proposed_type: Literal["REELS", "IMAGE", "STORIES", "CAROUSEL"],
     file_metadata: dict[str, Any],
+    *,
+    allow_story_override: bool = False,
 ) -> Literal["REELS", "IMAGE", "STORIES", "CAROUSEL"]:
     if file_metadata.get("is_carousel"):
         return "CAROUSEL"
+    file_name = str(file_metadata.get("name", ""))
+    if not allow_story_override and is_story_filename(file_name):
+        if proposed_type != "STORIES":
+            logger.info(
+                "Forzando media_type=STORIES para archivo de historia '%s' (Gemini propuso %s).",
+                file_name,
+                proposed_type,
+            )
+        return "STORIES"
     is_video = _is_video_file(file_metadata)
     if proposed_type == "STORIES":
         return "STORIES"
@@ -425,8 +455,14 @@ def _normalize_proposal(
     proposal: PostProposal,
     file_metadata: dict[str, Any],
     reference_now: datetime,
+    *,
+    allow_story_override: bool = False,
 ) -> PostProposal:
-    media_type = _normalize_media_type(proposal.media_type, file_metadata)
+    media_type = _normalize_media_type(
+        proposal.media_type,
+        file_metadata,
+        allow_story_override=allow_story_override,
+    )
 
     try:
         parsed_dt = datetime.fromisoformat(proposal.scheduled_time.strip())
@@ -445,12 +481,19 @@ def _normalize_proposal(
 
     raw_short = re.sub(r"^\d+[\.\-\s:]+", "", proposal.short_title.strip())
     raw_short = re.sub(r"^pro\s*tip\s*\d*[\.\-\s:]+", "", raw_short, flags=re.IGNORECASE)
+    if media_type == "STORIES":
+        raw_short = re.sub(r"^(?:historias?|story|stories)\s*[\.\-\s:]*", "", raw_short, flags=re.IGNORECASE)
     if not raw_short:
         raw_short = Path(str(file_metadata.get("name", "Publicacion"))).stem
 
-    promote = bool(proposal.promote_in_ads)
+    promote = bool(proposal.promote_in_ads) and media_type != "STORIES"
     daily_budget = round(max(1.0, proposal.ads_daily_budget_usd), 2) if promote else 0.0
     duration_days = max(1, int(proposal.ads_duration_days)) if promote else 0
+    ads_recommendation = (
+        "No aplica (Historia de 24h en Instagram)."
+        if media_type == "STORIES"
+        else proposal.ads_recommendation.strip()
+    )
 
     post_category = proposal.post_category
     if proposal.has_presenter_on_camera and post_category != "MAIN":
@@ -460,22 +503,27 @@ def _normalize_proposal(
             file_metadata.get("name"),
         )
         post_category = "MAIN"
-        if media_type == "STORIES":
-            media_type = "REELS" if _is_video_file(file_metadata) else "IMAGE"
 
-    clean_caption, clean_hashtags = _enforce_caption_and_hashtags(
-        proposal.caption,
-        proposal.hashtags,
-        max_count=MAX_INSTAGRAM_HASHTAGS,
-    )
+    if media_type == "STORIES":
+        clean_caption = re.sub(r"(?<!\S)#[\wáéíóúüñÁÉÍÓÚÜÑ]+", "", proposal.caption).strip()
+        clean_hashtags = ""
+    else:
+        clean_caption, clean_hashtags = _enforce_caption_and_hashtags(
+            proposal.caption,
+            proposal.hashtags,
+            max_count=MAX_INSTAGRAM_HASHTAGS,
+        )
     is_video = _is_video_file(file_metadata) and not bool(file_metadata.get("is_carousel"))
-    publish_to_tiktok = bool(proposal.publish_to_tiktok) and is_video
+    publish_to_tiktok = bool(proposal.publish_to_tiktok) and is_video and media_type != "STORIES"
     raw_tiktok_caption = proposal.tiktok_caption.strip()
-    clean_tiktok_caption, _ = _enforce_caption_and_hashtags(
-        raw_tiktok_caption or clean_caption,
-        clean_hashtags,
-        max_count=MAX_INSTAGRAM_HASHTAGS,
-    )
+    if media_type == "STORIES":
+        clean_tiktok_caption = ""
+    else:
+        clean_tiktok_caption, _ = _enforce_caption_and_hashtags(
+            raw_tiktok_caption or clean_caption,
+            clean_hashtags,
+            max_count=MAX_INSTAGRAM_HASHTAGS,
+        )
 
     return PostProposal(
         content_summary=proposal.content_summary.strip(),
@@ -492,7 +540,7 @@ def _normalize_proposal(
         promote_in_ads=promote,
         ads_daily_budget_usd=daily_budget,
         ads_duration_days=duration_days,
-        ads_recommendation=proposal.ads_recommendation.strip(),
+        ads_recommendation=ads_recommendation,
         has_keyword_cta=has_cta,
         keyword=keyword if has_cta else "",
         target_link=target_link,
@@ -715,7 +763,8 @@ def generate_post_proposal(
         f"=== PAUTAS DEL MES (REFERENCIA DE ESTILO, MARCA Y PUBLICACIONES EXISTENTES) ===\n{guidelines_text}\n\n"
         f"=== METADATOS DEL ARCHIVO EN DRIVE ===\n{file_meta_json}\n\n"
         "Analiza visualmente el archivo multimedia adjunto (si está disponible) y genera una propuesta inteligente:\n"
-        "- Verifica primero si es un video grabado por Manuel Martínez (persona hablando a cámara) -> OBLIGATORIAMENTE `MAIN` en Lun/Mié/Vie (`REELS`).\n"
+        "- Si el nombre del archivo empieza o viene marcado como Historia (`historia ...`, `story ...`, `(HISTORIA)`), clasifícalo OBLIGATORIAMENTE como `media_type = \"STORIES\"` (NUNCA `REELS`, ni TikTok, ni Ads).\n"
+        "- Si NO es una Historia, verifica primero si es un video grabado por Manuel Martínez (persona hablando a cámara) -> OBLIGATORIAMENTE `MAIN` en Lun/Mié/Vie (`REELS`).\n"
         "- Solo usa `PRO_TIP` (Mar/Jue/Sáb) si es un video corto de textos e imágenes estáticas tipo carrusel automático SIN persona a cámara, o una imagen vertical de texto.\n"
         "- Adapta obligatoriamente (tanto para videos como para imágenes nuevas) el gancho (`hook_title`), el enfoque del `caption`, el `trend_alignment` y los hashtags para que esta pauta automática siga las tendencias actuales del momento y gane seguidores orgánicos.\n"
         "- Razona la mejor fecha y hora sin copiar ciegamente horas fijas anteriores.\n"
@@ -858,7 +907,15 @@ def revise_post_proposal(
     else:
         raise GeminiAgentError("Gemini devolvió una revisión vacía.")
 
-    normalized = _normalize_proposal(result.proposal, file_metadata, now)
+    explicit_format_switch = bool(
+        re.search(r"\b(reel|reels|feed|carrusel|imagen|publicaci[oó]n normal|historia|story|stories)\b", feedback, re.IGNORECASE)
+    )
+    normalized = _normalize_proposal(
+        result.proposal,
+        file_metadata,
+        now,
+        allow_story_override=force_apply or explicit_format_switch,
+    )
     assessment: Literal["ACCEPTED", "ALTERNATIVE_SUGGESTED"] = (
         "ACCEPTED" if force_apply else result.ai_assessment
     )

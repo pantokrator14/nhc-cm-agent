@@ -39,6 +39,8 @@ class Settings:
 
     meta_access_token: str
     ig_user_id: str
+    google_drive_impersonate_email: str = ""
+    google_oauth_credentials: Path | None = None
     telegram_extra_admin_chat_ids: tuple[int, ...] = ()
     meta_ad_account_id: str = ""
     meta_saved_audience_name: str = DEFAULT_META_SAVED_AUDIENCE_NAME
@@ -111,6 +113,8 @@ def load_settings(env_path: str | Path | None = None) -> Settings:
         os.getenv("GOOGLE_APPLICATION_CREDENTIALS", DEFAULT_CREDENTIALS_REL).strip()
         or DEFAULT_CREDENTIALS_REL
     )
+    google_drive_impersonate_email = os.getenv("GOOGLE_DRIVE_IMPERSONATE_EMAIL", "").strip()
+    google_oauth_raw = os.getenv("GOOGLE_OAUTH_CREDENTIALS", "").strip()
     drive_root_folder_id = _require_env("DRIVE_ROOT_FOLDER_ID", missing)
 
     telegram_bot_token = _require_env("TELEGRAM_BOT_TOKEN", missing)
@@ -190,17 +194,30 @@ def load_settings(env_path: str | Path | None = None) -> Settings:
             "WEBHOOK_PORT debe ser un puerto TCP válido entre 1 y 65535."
         ) from exc
 
+    google_oauth_credentials: Path | None = None
+    if google_oauth_raw:
+        google_oauth_credentials = resolve_project_path(google_oauth_raw)
+        if not google_oauth_credentials.is_file():
+            raise ConfigurationError(
+                f"No se encontró el archivo OAuth de Google en GOOGLE_OAUTH_CREDENTIALS: {google_oauth_credentials}"
+            )
+
     credentials_path = resolve_project_path(credentials_raw)
     if not credentials_path.is_file():
-        raise ConfigurationError(
-            f"No se encontró el archivo de Service Account en GOOGLE_APPLICATION_CREDENTIALS: {credentials_path}"
-        )
+        if google_oauth_credentials is not None:
+            credentials_path = google_oauth_credentials
+        else:
+            raise ConfigurationError(
+                f"No se encontró el archivo de credenciales de Google en GOOGLE_APPLICATION_CREDENTIALS: {credentials_path}"
+            )
 
     return Settings(
         gemini_api_key=gemini_api_key,
         gemini_model=gemini_model,
         google_application_credentials=credentials_path,
         drive_root_folder_id=drive_root_folder_id,
+        google_drive_impersonate_email=google_drive_impersonate_email,
+        google_oauth_credentials=google_oauth_credentials,
         telegram_bot_token=telegram_bot_token,
         telegram_admin_chat_id=telegram_admin_chat_id,
         telegram_extra_admin_chat_ids=tuple(extra_admin_ids),
