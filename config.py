@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import timedelta, timezone, tzinfo
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from dotenv import load_dotenv
 
@@ -18,6 +20,18 @@ DEFAULT_WEBHOOK_PORT = 8000
 DEFAULT_META_SAVED_AUDIENCE_NAME = "mujeres"
 DEFAULT_TIKTOK_PUBLISH_MODE = "DIRECT"
 DEFAULT_TIKTOK_PRIVACY_LEVEL = "PUBLIC_TO_EVERYONE"
+DEFAULT_TIMEZONE = "America/Caracas"
+
+
+def resolve_timezone(tz_name: str = DEFAULT_TIMEZONE) -> tzinfo:
+    """Resolve an IANA timezone name (defaults to Venezuela `America/Caracas`, UTC-4)."""
+    cleaned = (tz_name or DEFAULT_TIMEZONE).strip() or DEFAULT_TIMEZONE
+    try:
+        return ZoneInfo(cleaned)
+    except ZoneInfoNotFoundError as exc:
+        if cleaned == DEFAULT_TIMEZONE:
+            return timezone(timedelta(hours=-4), name="VET")
+        raise ConfigurationError(f"TIMEZONE inválido o no disponible: '{cleaned}'.") from exc
 
 
 class ConfigurationError(ValueError):
@@ -58,9 +72,15 @@ class Settings:
 
     webhook_verify_token: str = DEFAULT_WEBHOOK_VERIFY_TOKEN
     webhook_port: int = DEFAULT_WEBHOOK_PORT
+    timezone_name: str = DEFAULT_TIMEZONE
 
     base_dir: Path = BASE_DIR
     state_file_path: Path = DEFAULT_STATE_PATH
+
+    @property
+    def tzinfo(self) -> tzinfo:
+        """Return resolved `tzinfo` for all scheduling, Pautas, and reporting."""
+        return resolve_timezone(self.timezone_name)
 
     @property
     def telegram_admin_chat_ids(self) -> tuple[int, ...]:
@@ -159,6 +179,11 @@ def load_settings(env_path: str | Path | None = None) -> Settings:
         os.getenv("WEBHOOK_PORT", str(DEFAULT_WEBHOOK_PORT)).strip()
         or str(DEFAULT_WEBHOOK_PORT)
     )
+    timezone_name = (
+        os.getenv("TIMEZONE", DEFAULT_TIMEZONE).strip()
+        or DEFAULT_TIMEZONE
+    )
+    resolve_timezone(timezone_name)
 
     if missing:
         raise ConfigurationError(
@@ -237,6 +262,7 @@ def load_settings(env_path: str | Path | None = None) -> Settings:
         tiktok_privacy_level=tiktok_privacy_level,
         webhook_verify_token=webhook_verify_token,
         webhook_port=webhook_port,
+        timezone_name=timezone_name,
         base_dir=BASE_DIR,
         state_file_path=DEFAULT_STATE_PATH,
     )

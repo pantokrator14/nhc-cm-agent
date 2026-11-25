@@ -595,7 +595,7 @@ class NelHealthCoachBot:
         )
 
     def _get_reference_now(self) -> datetime:
-        return datetime.now().astimezone()
+        return datetime.now(self.settings.tzinfo)
 
     def _get_effective_meta_token(self) -> str:
         return get_effective_meta_token(
@@ -2114,6 +2114,8 @@ class NelHealthCoachBot:
             )
             self.pending_proposals[session.proposal_id] = session
             scheduled_dt = datetime.fromisoformat(session.proposal.scheduled_time)
+            if scheduled_dt.tzinfo is None:
+                scheduled_dt = scheduled_dt.replace(tzinfo=self._get_reference_now().tzinfo)
             now_utc = datetime.now(timezone.utc)
             run_immediately = scheduled_dt.astimezone(timezone.utc) <= now_utc
             run_date = now_utc + timedelta(seconds=1) if run_immediately else scheduled_dt
@@ -3606,7 +3608,11 @@ class NelHealthCoachBot:
             ),
         ]
         for job in scheduled_jobs:
-            run_time = job.next_run_time.isoformat() if job.next_run_time else "N/A"
+            run_time = (
+                job.next_run_time.astimezone(self.settings.tzinfo).strftime("%Y-%m-%d %H:%M (%Z)")
+                if job.next_run_time
+                else "N/A"
+            )
             lines.append(
                 f"  - <code>{html.escape(job.id)}</code> → <code>{html.escape(run_time)}</code>"
             )

@@ -80,7 +80,7 @@ async def run_monthly_drive_review(
         return
 
     async with scan_lock:
-        local_now = datetime.now().astimezone()
+        local_now = datetime.now(settings.tzinfo)
         year_str = local_now.strftime("%Y")
         month_str = local_now.strftime("%m")
         logger.info(
@@ -335,7 +335,7 @@ async def run_monthly_drive_review(
 
 async def run_agent(settings: Settings) -> None:
     """Run FastAPI/Uvicorn, Telegram Bot polling, and APScheduler in a single asyncio loop."""
-    scheduler = AsyncIOScheduler()
+    scheduler = AsyncIOScheduler(timezone=settings.tzinfo)
     scan_lock = asyncio.Lock()
 
     bot_controller = NelHealthCoachBot(
@@ -416,12 +416,12 @@ async def run_agent(settings: Settings) -> None:
             trigger=IntervalTrigger(minutes=DRIVE_POLL_INTERVAL_MINUTES),
             id="drive_poll_job",
             replace_existing=True,
-            next_run_time=datetime.now().astimezone(),
+            next_run_time=datetime.now(settings.tzinfo),
             max_instances=1,
         )
         scheduler.add_job(
             scheduled_weekly_metrics,
-            trigger=CronTrigger(day_of_week="sun", hour=20, minute=0),
+            trigger=CronTrigger(day_of_week="sun", hour=20, minute=0, timezone=settings.tzinfo),
             id="weekly_metrics_report_job",
             replace_existing=True,
             max_instances=1,
@@ -429,10 +429,10 @@ async def run_agent(settings: Settings) -> None:
         )
         scheduler.add_job(
             scheduled_meta_token_check,
-            trigger=CronTrigger(hour=9, minute=0),
+            trigger=CronTrigger(hour=9, minute=0, timezone=settings.tzinfo),
             id="meta_token_health_job",
             replace_existing=True,
-            next_run_time=datetime.now().astimezone(),
+            next_run_time=datetime.now(settings.tzinfo),
             max_instances=1,
             misfire_grace_time=3600,
         )
@@ -441,11 +441,12 @@ async def run_agent(settings: Settings) -> None:
             trigger=IntervalTrigger(minutes=3),
             id="ig_dm_poll_job",
             replace_existing=True,
-            next_run_time=datetime.now().astimezone() + timedelta(seconds=20),
+            next_run_time=datetime.now(settings.tzinfo) + timedelta(seconds=20),
             max_instances=1,
         )
         logger.info(
-            "APScheduler iniciado: escaneo de Drive cada %d min + respaldo DMs cada 3 min + informe semanal domingos 20:00 + chequeo diario de META_ACCESS_TOKEN.",
+            "APScheduler iniciado (zona horaria %s): escaneo de Drive cada %d min + respaldo DMs cada 3 min + informe semanal domingos 20:00 + chequeo diario de META_ACCESS_TOKEN.",
+            settings.timezone_name,
             DRIVE_POLL_INTERVAL_MINUTES,
         )
 
@@ -468,6 +469,7 @@ async def run_agent(settings: Settings) -> None:
             await bot_controller._send_admin_message(
                 text=(
                     "🟢 <b>Agente @nelhealthcoach iniciado</b>\n"
+                    f"• Zona horaria: <code>{settings.timezone_name}</code> (Hora Venezuela UTC-4)\n"
                     f"• Drive YYYY/MM cada {DRIVE_POLL_INTERVAL_MINUTES} min (Reels, Imágenes y carpetas <code>(CARRUSEL)</code>)\n"
                     "• Ubicación IG fija: <code>California</code>\n"
                     "• Comentarios, DMs y Solicitudes de mensaje IG con respuestas asistidas activados\n"

@@ -412,6 +412,34 @@ class TestMetricsArgsAndDmPolling(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(get_effective_meta_token("brand-new-env-tok", state_path), "brand-new-env-tok")
 
+    def test_settings_defaults_to_venezuela_timezone_america_caracas(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            sa = tmp / "sa.json"
+            sa.write_text("{}", encoding="utf-8")
+            s = _make_settings(tmp, sa)
+            self.assertEqual(s.timezone_name, "America/Caracas")
+            now_ve = datetime.now(s.tzinfo)
+            self.assertEqual(now_ve.utcoffset().total_seconds(), -4 * 3600)
+
+            from drive_service import parse_guidelines_entries
+
+            entries = parse_guidelines_entries(
+                "=== PAUTAS DEL MES ===\n"
+                "8. Orinar\n"
+                "Fecha: Miércoles 25/11/2026\n"
+                "Horario: 19:00 hrs\n"
+                "Pauta en Meta Ads: Orgánico.\n"
+                "Título / Gancho: Test\n"
+                "Caption:\nHola\n"
+                "Hashtags: #salud\n",
+                default_tz=s.tzinfo,
+            )
+            self.assertEqual(len(entries), 1)
+            self.assertIsNotNone(entries[0].scheduled_dt)
+            self.assertEqual(entries[0].scheduled_dt.hour, 19)
+            self.assertEqual(entries[0].scheduled_dt.utcoffset().total_seconds(), -4 * 3600)
+
     async def test_fetch_dm_messages_resolves_linked_page_and_skips_answered_threads(self) -> None:
         from meta_publisher import fetch_instagram_dm_messages_with_status
 

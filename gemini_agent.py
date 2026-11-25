@@ -17,6 +17,8 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 
+from config import resolve_timezone
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
@@ -568,7 +570,7 @@ def fetch_social_trends_brief(
         ):
             return cached_brief
 
-    now = current_time or datetime.now().astimezone()
+    now = current_time or datetime.now(resolve_timezone())
     client, resolved_model = _resolve_client_and_model(api_key, model)
     search_prompt = (
         f"Fecha actual: {now.strftime('%Y-%m-%d')} ({now.strftime('%B %Y')}).\n"
@@ -727,7 +729,7 @@ def generate_post_proposal(
     media_file_paths: list[Path] | None = None,
 ) -> PostProposal:
     """Analyze the actual media file (when provided) + guidelines + live trends and propose a post."""
-    now = current_time or datetime.now().astimezone()
+    now = current_time or datetime.now(resolve_timezone())
     file_name = str(file_metadata.get("name", file_metadata.get("id", "")))
     file_meta_json = json.dumps(file_metadata, ensure_ascii=False, indent=2)
     occupied_block = (
@@ -841,7 +843,7 @@ def revise_post_proposal(
     trends_brief: str | None = None,
 ) -> RevisionResult:
     """Critically evaluate admin change requests, reason alternatives, and respect insistence."""
-    now = current_time or datetime.now().astimezone()
+    now = current_time or datetime.now(resolve_timezone())
     file_name = str(file_metadata.get("name", file_metadata.get("id", "")))
     file_meta_json = json.dumps(file_metadata, ensure_ascii=False, indent=2)
     previous_json = previous_proposal.model_dump_json(indent=2)
@@ -935,7 +937,7 @@ def generate_trend_ideas(
     performance_memory: str = "",
 ) -> TrendReport:
     """Analyze live social media trends and suggest standalone viral/organic post ideas."""
-    now = current_time or datetime.now().astimezone()
+    now = current_time or datetime.now(resolve_timezone())
     trends_brief = fetch_social_trends_brief(
         current_time=now,
         api_key=api_key,

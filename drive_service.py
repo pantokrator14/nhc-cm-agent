@@ -33,7 +33,7 @@ from googleapiclient.discovery import Resource, build
 from googleapiclient.errors import HttpError
 from googleapiclient.http import MediaInMemoryUpload, MediaIoBaseDownload
 
-from config import DEFAULT_CREDENTIALS_REL, DEFAULT_STATE_PATH, resolve_project_path
+from config import DEFAULT_CREDENTIALS_REL, DEFAULT_STATE_PATH, resolve_project_path, resolve_timezone
 
 logger = logging.getLogger(__name__)
 
@@ -2151,7 +2151,7 @@ def _parse_fecha_horario(
     horario_raw: str,
     default_tz: tzinfo | None = None,
 ) -> datetime | None:
-    tz = default_tz or datetime.now().astimezone().tzinfo
+    tz = default_tz or resolve_timezone()
     date_match = re.search(r"(\d{1,2})[/-](\d{1,2})(?:[/-](\d{2,4}))?", fecha_raw)
     if not date_match:
         iso_match = re.search(r"(\d{4})-(\d{2})-(\d{2})", fecha_raw)
@@ -2423,7 +2423,7 @@ def find_unpublished_guidelines(
     reference_now: datetime | None = None,
 ) -> list[UnpublishedGuidelineItem]:
     """Return `Pautas` entries that do not appear published yet in state, Drive, or Instagram."""
-    now = reference_now or datetime.now().astimezone()
+    now = reference_now or datetime.now(resolve_timezone())
     state = load_state(state_path)
     recorded_files: dict[str, Any] = state["files"]
     published_headers: dict[str, Any] = state.get("published_guideline_headers", {})
