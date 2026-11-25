@@ -356,6 +356,62 @@ class TestMetricsArgsAndDmPolling(unittest.IsolatedAsyncioTestCase):
             final_reply = reply_msg.reply_text.call_args_list[-1].args[0]
             self.assertIn("instagram_manage_messages", final_reply)
 
+    async def test_meta_token_health_clears_stale_state_and_uses_new_env_token(self) -> None:
+        from drive_service import get_effective_meta_token, load_state, save_meta_auth_state
+        from meta_publisher import MetaTokenStatus
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            bot_ctrl, mock_tg_bot = _make_bot(tmp)
+            state_path = tmp / "state.json"
+
+            # Legacy stale state.json entry (old invalidated token without source_env_fp)
+            save_meta_auth_state({"access_token": "old-revoked-tok", "expires_at": 0}, state_path)
+            self.assertEqual(get_effective_meta_token("meta-tok", state_path), "old-revoked-tok")
+
+            # First check fails on old token -> must clear state and retry with env token ("meta-tok")
+            invalid_st = MetaTokenStatus(
+                is_valid=False,
+                is_permanent=False,
+                expires_at=0,
+                days_remaining=0,
+                refreshed=False,
+                active_token="old-revoked-tok",
+                message="Invalid OAuth access token",
+            )
+            valid_st = MetaTokenStatus(
+                is_valid=True,
+                is_permanent=True,
+                expires_at=0,
+                days_remaining=None,
+                refreshed=False,
+                active_token="meta-tok",
+                message="Token permanente activo",
+            )
+
+            with patch(
+                "telegram_bot.check_and_refresh_meta_token",
+                AsyncMock(side_effect=[invalid_st, valid_st]),
+            ) as mock_check:
+                res = await bot_ctrl.check_meta_token_health(notify_always=True)
+
+            self.assertTrue(res.is_valid)
+            self.assertEqual(mock_check.await_count, 2)
+            self.assertEqual(mock_check.await_args_list[0].kwargs["access_token"], "old-revoked-tok")
+            self.assertEqual(mock_check.await_args_list[1].kwargs["access_token"], "meta-tok")
+            self.assertEqual(load_state(state_path)["meta_auth"], {})
+
+            # When source_env_fp mismatches new .env token, get_effective_meta_token picks new env token immediately
+            save_meta_auth_state(
+                {
+                    "access_token": "extended-old-tok",
+                    "expires_at": 9999999999,
+                    "source_env_fp": "different_fp_000",
+                },
+                state_path,
+            )
+            self.assertEqual(get_effective_meta_token("brand-new-env-tok", state_path), "brand-new-env-tok")
+
     async def test_fetch_dm_messages_resolves_linked_page_and_skips_answered_threads(self) -> None:
         from meta_publisher import fetch_instagram_dm_messages_with_status
 

@@ -43,6 +43,7 @@ from drive_service import (
     append_entry_to_monthly_doc,
     append_or_create_scripts_doc,
     check_google_oauth_token_health,
+    clear_meta_auth_state,
     collect_previous_weekly_reports,
     compute_month_week_info,
     compute_next_numbering_and_filename,
@@ -3386,13 +3387,25 @@ class NelHealthCoachBot:
     async def check_meta_token_health(self, *, notify_always: bool = False) -> MetaTokenStatus:
         """Inspect META_ACCESS_TOKEN expiry, auto-extend when possible, and alert admins if needed."""
         current_token = await asyncio.to_thread(self._get_effective_meta_token)
+        env_token = self.settings.meta_access_token.strip()
         status = await check_and_refresh_meta_token(
             access_token=current_token,
             app_id=self.settings.meta_app_id,
             app_secret=self.settings.meta_app_secret,
             state_path=self.settings.state_file_path,
             warn_days_threshold=7,
+            source_env_token=env_token,
         )
+        if not status.is_valid and env_token and current_token.strip() != env_token:
+            await asyncio.to_thread(clear_meta_auth_state, self.settings.state_file_path)
+            status = await check_and_refresh_meta_token(
+                access_token=env_token,
+                app_id=self.settings.meta_app_id,
+                app_secret=self.settings.meta_app_secret,
+                state_path=self.settings.state_file_path,
+                warn_days_threshold=7,
+                source_env_token=env_token,
+            )
         self.last_meta_token_status = status
         today_key = self._get_reference_now().strftime("%Y-%m-%d")
 

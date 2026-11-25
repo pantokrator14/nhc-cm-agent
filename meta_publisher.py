@@ -13,6 +13,8 @@ from typing import Any, Literal
 import httpx
 
 from drive_service import (
+    _token_fingerprint,
+    clear_meta_auth_state,
     get_cached_location_id,
     save_cached_location_id,
     save_meta_auth_state,
@@ -613,10 +615,12 @@ async def check_and_refresh_meta_token(
     app_secret: str = "",
     state_path: Path | str | None = None,
     warn_days_threshold: int = 7,
+    source_env_token: str = "",
 ) -> MetaTokenStatus:
     """Inspect `META_ACCESS_TOKEN` via `/debug_token`, extend if possible, and report status."""
     debug_auth = f"{app_id}|{app_secret}" if (app_id and app_secret) else access_token
     current_token = access_token.strip()
+    env_fp = _token_fingerprint(source_env_token or current_token)
 
     async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
         resp = await client.get(
@@ -625,6 +629,8 @@ async def check_and_refresh_meta_token(
         )
         if resp.is_error:
             err_msg = _extract_meta_error(resp)
+            if state_path is not None:
+                await asyncio.to_thread(clear_meta_auth_state, state_path)
             return MetaTokenStatus(
                 is_valid=False,
                 is_permanent=False,
@@ -641,6 +647,8 @@ async def check_and_refresh_meta_token(
 
         if not is_valid:
             err_detail = (data.get("error") or {}).get("message") or "Token inválido o expirado"
+            if state_path is not None:
+                await asyncio.to_thread(clear_meta_auth_state, state_path)
             return MetaTokenStatus(
                 is_valid=False,
                 is_permanent=False,
@@ -658,6 +666,7 @@ async def check_and_refresh_meta_token(
                 {
                     "access_token": current_token,
                     "expires_at": 0,
+                    "source_env_fp": env_fp,
                     "checked_at": datetime.utcnow().isoformat() + "Z",
                 },
                 state_path,
@@ -703,6 +712,7 @@ async def check_and_refresh_meta_token(
             {
                 "access_token": current_token,
                 "expires_at": expires_at,
+                "source_env_fp": env_fp,
                 "checked_at": datetime.utcnow().isoformat() + "Z",
             },
             state_path,

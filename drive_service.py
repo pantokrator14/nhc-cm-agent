@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import calendar
+import hashlib
 import html as html_lib
 import io
 import json
@@ -568,11 +569,32 @@ def save_tiktok_auth_state(
         _save_state_unlocked(state, path)
 
 
+def _token_fingerprint(token: str) -> str:
+    """Return a short non-reversible SHA-256 fingerprint for comparing `.env` tokens."""
+    cleaned = token.strip()
+    if not cleaned:
+        return ""
+    return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:16]
+
+
 def get_meta_auth_state(state_path: Path | str | None = None) -> dict[str, Any]:
     """Return persisted Meta access token metadata (`access_token`, `expires_at`, `checked_at`)."""
     state = load_state(state_path)
     auth = state.get("meta_auth")
     return dict(auth) if isinstance(auth, dict) else {}
+
+
+def clear_meta_auth_state(state_path: Path | str | None = None) -> None:
+    """Clear persisted Meta access token metadata from `state.json` (e.g. when revoked)."""
+    path = _get_state_path(state_path)
+    with _STATE_LOCK:
+        try:
+            state = _read_state_unlocked(path)
+        except DriveServiceError:
+            state = _empty_state()
+        if state.get("meta_auth"):
+            state["meta_auth"] = {}
+            _save_state_unlocked(state, path)
 
 
 def save_meta_auth_state(
@@ -598,12 +620,16 @@ def get_effective_meta_token(
     state_path: Path | str | None = None,
 ) -> str:
     """Return the freshest valid Meta access token (persisted in state or fallback to `.env`)."""
+    env_clean = env_token.strip()
     meta_auth = get_meta_auth_state(state_path)
     persisted = str(meta_auth.get("access_token", "")).strip()
+    source_fp = str(meta_auth.get("source_env_fp", "")).strip()
     expires_at = int(meta_auth.get("expires_at") or 0)
+    if source_fp and env_clean and source_fp != _token_fingerprint(env_clean):
+        return env_clean
     if persisted and (expires_at == 0 or expires_at > time.time() + 60):
         return persisted
-    return env_token.strip()
+    return env_clean
 
 
 LOCATION_ROTATION_OPTIONS: tuple[str, ...] = ("California",)
