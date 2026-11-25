@@ -436,7 +436,7 @@ async def run_agent(settings: Settings) -> None:
                 text=(
                     "🟢 <b>Agente @nelhealthcoach iniciado</b>\n"
                     f"• Drive YYYY/MM cada {DRIVE_POLL_INTERVAL_MINUTES} min (Reels, Imágenes y carpetas <code>(CARRUSEL)</code>)\n"
-                    "• Ubicación IG alternada: <code>Estados Unidos</code> ↔ <code>California</code>\n"
+                    "• Ubicación IG fija: <code>California</code>\n"
                     "• Comentarios, DMs y Solicitudes de mensaje IG con respuestas asistidas activados\n"
                     "• Monitoreo diario preventivo de META_ACCESS_TOKEN activado\n"
                     "• Informe semanal de métricas: Domingos 20:00 hrs\n"

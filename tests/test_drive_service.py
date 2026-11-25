@@ -475,6 +475,75 @@ class TestDriveWeeksAndGuidelinesLogic(unittest.TestCase):
         self.assertEqual(reports[1]["title"], "Informe_S2.pdf")
         self.assertIn("Alcance: 655", reports[1]["text"])
 
+    def test_update_and_append_entry_apply_heading3_and_bold_keys_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sa_path = _write_sa_json(Path(tmpdir))
+            entry_lines = drive_service.format_guideline_entry_lines(
+                doc_header="01. Apertura",
+                scheduled_dt=datetime(2026, 11, 25, 19, 0, tzinfo=timezone.utc),
+                promote_in_ads=False,
+                ads_recommendation="Orgánico.",
+                hook_title="Gancho fuerte 🌱",
+                caption="Texto del caption",
+                hashtags="#salud #bienestar",
+            )
+            # No double "Orgánico (Orgánico.)"
+            self.assertIn("Pauta en Meta Ads: Orgánico.", entry_lines)
+
+            mock_docs = MagicMock()
+            mock_docs.documents().get().execute.return_value = {
+                "body": {
+                    "content": [
+                        {
+                            "startIndex": 1,
+                            "endIndex": 20,
+                            "paragraph": {"elements": [{"textRun": {"content": "=== PAUTAS DEL MES ===\n"}}]},
+                        },
+                        {
+                            "startIndex": 20,
+                            "endIndex": 34,
+                            "paragraph": {"elements": [{"textRun": {"content": "01. Apertura\n"}}]},
+                        },
+                        {
+                            "startIndex": 34,
+                            "endIndex": 55,
+                            "paragraph": {"elements": [{"textRun": {"content": "Fecha: 10/11/2026\n"}}]},
+                        },
+                    ]
+                }
+            }
+            mock_docs.documents().batchUpdate().execute.return_value = {}
+
+            with patch.object(drive_service, "_get_docs_client", return_value=mock_docs):
+                mode = drive_service.update_entry_in_monthly_doc(
+                    doc_id="doc_pautas",
+                    target_header="01. Apertura",
+                    new_entry_lines=entry_lines,
+                    credentials_path=sa_path,
+                )
+
+            self.assertEqual(mode, "docs_api")
+            reqs = mock_docs.documents().batchUpdate.call_args.kwargs["body"]["requests"]
+            para_styles = [r["updateParagraphStyle"] for r in reqs if "updateParagraphStyle" in r]
+            # First resets whole block to NORMAL_TEXT, second sets header to HEADING_3
+            self.assertEqual(para_styles[0]["paragraphStyle"]["namedStyleType"], "NORMAL_TEXT")
+            self.assertEqual(para_styles[1]["paragraphStyle"]["namedStyleType"], "HEADING_3")
+            self.assertEqual(para_styles[1]["range"], {"startIndex": 20, "endIndex": 32})
+
+            text_styles = [r["updateTextStyle"] for r in reqs if "updateTextStyle" in r]
+            # Body reset clears bold + fontSize
+            body_reset = [t for t in text_styles if t["textStyle"] == {"bold": False}]
+            self.assertEqual(len(body_reset), 1)
+            self.assertEqual(body_reset[0]["fields"], "bold,fontSize")
+            # Key prefixes bolded (Fecha:, Horario:, Pauta en Meta Ads:, Título / Gancho:, Caption:, Hashtags:)
+            bold_keys = [
+                t for t in text_styles
+                if t["textStyle"] == {"bold": True} and t["fields"] == "bold"
+            ]
+            self.assertEqual(len(bold_keys), 6)
+            self.assertEqual(drive_service.get_next_location_label(advance=True, state_path=Path(tmpdir) / "state.json"), "California")
+            self.assertEqual(drive_service.get_next_location_label(advance=True, state_path=Path(tmpdir) / "state.json"), "California")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -396,7 +396,7 @@ def _format_proposal_html(
     )
 
     location_line = (
-        f"📍 <b>Ubicación (IG):</b> {html.escape(session.location_label or 'Estados Unidos / California (alternada)')}\n"
+        "📍 <b>Ubicación (IG):</b> California\n"
         if p.media_type != "STORIES"
         else ""
     )
@@ -523,7 +523,7 @@ class NelHealthCoachBot:
                     existing_doc_header=str(payload.get("existing_doc_header", "")),
                     doc_header=str(payload.get("doc_header", "")),
                     technical_note=str(payload.get("technical_note", "")),
-                    location_label=str(payload.get("location_label", "")),
+                    location_label="" if proposal.media_type == "STORIES" else "California",
                 )
             except Exception as exc:
                 logger.warning("No se pudo restaurar sesión programada %s: %s", proposal_id, exc)
@@ -1593,20 +1593,15 @@ class NelHealthCoachBot:
             location_label = ""
             location_id = ""
             if proposal.media_type != "STORIES":
-                location_label = session.location_label or await asyncio.to_thread(
+                location_label = await asyncio.to_thread(
                     get_next_location_label,
                     advance=False,
                     state_path=self.settings.state_file_path,
                 )
-                override_loc = (
-                    self.settings.meta_location_id_us
-                    if location_label == "Estados Unidos"
-                    else self.settings.meta_location_id_ca
-                )
                 location_id = await resolve_instagram_location_id(
                     access_token=meta_token,
                     location_name=location_label,
-                    override_id=override_loc,
+                    override_id=self.settings.meta_location_id_ca,
                     state_path=self.settings.state_file_path,
                 )
 

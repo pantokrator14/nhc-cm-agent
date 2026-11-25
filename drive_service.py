@@ -600,7 +600,7 @@ def get_effective_meta_token(
     return env_token.strip()
 
 
-LOCATION_ROTATION_OPTIONS: tuple[str, ...] = ("Estados Unidos", "California")
+LOCATION_ROTATION_OPTIONS: tuple[str, ...] = ("California",)
 
 
 def get_next_location_label(
@@ -608,7 +608,7 @@ def get_next_location_label(
     advance: bool = False,
     state_path: Path | str | None = None,
 ) -> str:
-    """Return the next alternating Instagram location label ('Estados Unidos' <-> 'California')."""
+    """Return the configured Instagram location label (fixed to 'California')."""
     path = _get_state_path(state_path)
     with _STATE_LOCK:
         try:
@@ -1389,8 +1389,101 @@ def find_previous_month_guidelines_text(
     return None
 
 
-def _lines_to_html_paragraphs(lines: list[str], bold_prefixes: tuple[str, ...] = ()) -> str:
+def _utf16_len(text: str) -> int:
+    """Return length in UTF-16 code units as required by Google Docs API ranges."""
+    return len(text.encode("utf-16-le")) // 2
+
+
+def _build_entry_style_requests(
+    *,
+    entry_start: int,
+    entry_lines: list[str],
+    bold_prefixes: tuple[str, ...],
+    trailing_newlines: int = 1,
+) -> list[dict[str, Any]]:
+    """Build Google Docs API style requests: `HEADING_3` header + `NORMAL_TEXT` body with bold keys."""
+    if not entry_lines:
+        return []
+
+    joined = "\n".join(entry_lines)
+    block_end = entry_start + _utf16_len(joined) + (1 if trailing_newlines > 0 else 0)
+    requests: list[dict[str, Any]] = [
+        {
+            "updateParagraphStyle": {
+                "range": {"startIndex": entry_start, "endIndex": block_end},
+                "paragraphStyle": {"namedStyleType": "NORMAL_TEXT"},
+                "fields": "namedStyleType",
+            }
+        }
+    ]
+
+    header_line = entry_lines[0]
+    header_len = _utf16_len(header_line)
+    header_range_end = max(entry_start + 1, entry_start + header_len)
+    requests.append(
+        {
+            "updateParagraphStyle": {
+                "range": {"startIndex": entry_start, "endIndex": header_range_end},
+                "paragraphStyle": {"namedStyleType": "HEADING_3"},
+                "fields": "namedStyleType",
+            }
+        }
+    )
+    requests.append(
+        {
+            "updateTextStyle": {
+                "range": {"startIndex": entry_start, "endIndex": header_range_end},
+                "textStyle": {"bold": True},
+                "fields": "bold,fontSize",
+            }
+        }
+    )
+
+    body_start = entry_start + header_len + 1
+    if body_start < block_end:
+        requests.append(
+            {
+                "updateTextStyle": {
+                    "range": {"startIndex": body_start, "endIndex": block_end},
+                    "textStyle": {"bold": False},
+                    "fields": "bold,fontSize",
+                }
+            }
+        )
+
+    cursor = body_start
+    ordered_prefixes = tuple(sorted(bold_prefixes, key=len, reverse=True))
+    for line in entry_lines[1:]:
+        line_len = _utf16_len(line)
+        matched_prefix = next((p for p in ordered_prefixes if line.startswith(p)), None)
+        if matched_prefix:
+            prefix_len = _utf16_len(matched_prefix)
+            if prefix_len > 0:
+                requests.append(
+                    {
+                        "updateTextStyle": {
+                            "range": {
+                                "startIndex": cursor,
+                                "endIndex": cursor + prefix_len,
+                            },
+                            "textStyle": {"bold": True},
+                            "fields": "bold",
+                        }
+                    }
+                )
+        cursor += line_len + 1
+
+    return requests
+
+
+def _lines_to_html_paragraphs(
+    lines: list[str],
+    bold_prefixes: tuple[str, ...] = (),
+    *,
+    entry_header_as_h3: bool = False,
+) -> str:
     paragraphs: list[str] = []
+    ordered_prefixes = tuple(sorted(bold_prefixes, key=len, reverse=True))
     for idx, raw_line in enumerate(lines):
         line = raw_line.rstrip()
         if not line:
@@ -1401,8 +1494,19 @@ def _lines_to_html_paragraphs(lines: list[str], bold_prefixes: tuple[str, ...] =
             continue
 
         escaped = html_lib.escape(line)
-        is_header = idx == 0 or line.startswith("===")
-        matched_prefix = next((p for p in bold_prefixes if line.startswith(p)), None)
+        is_divider = line.startswith("===")
+        is_entry_h3 = entry_header_as_h3 and not is_divider and (
+            _match_entry_header(line) is not None or idx == 0
+        )
+        if is_entry_h3:
+            paragraphs.append(
+                '<h3 style="margin:10pt 0 2pt 0;padding:0;font-family:Arial;font-size:13pt;font-weight:700;">'
+                f"{escaped}</h3>"
+            )
+            continue
+
+        is_header = idx == 0 or is_divider
+        matched_prefix = next((p for p in ordered_prefixes if line.startswith(p)), None)
 
         if is_header:
             inner = f'<span style="font-family:Arial;font-size:11pt;font-weight:700;">{escaped}</span>'
@@ -1432,14 +1536,8 @@ def create_monthly_guidelines_doc(
     lines = plain_text_content.splitlines()
     body_html = _lines_to_html_paragraphs(
         lines,
-        bold_prefixes=(
-            "Fecha:",
-            "Horario:",
-            "Pauta en Meta Ads:",
-            "Título / Gancho:",
-            "Caption:",
-            "Hashtags:",
-        ),
+        bold_prefixes=_ENTRY_BOLD_PREFIXES,
+        entry_header_as_h3=True,
     )
     full_html = f"<html><body>{body_html}</body></html>"
 
@@ -1588,10 +1686,21 @@ def format_guideline_entry_lines(
     horario_str = f"{scheduled_dt.strftime('%H:%M')} hrs"
 
     clean_ads = ads_recommendation.strip()
+    norm_ads = _normalize_match_text(clean_ads)
     if promote_in_ads:
-        ads_line = f"SÍ ({clean_ads})" if clean_ads else "SÍ"
+        if not clean_ads or norm_ads in {"si", "sí"}:
+            ads_line = "SÍ"
+        elif norm_ads.startswith("si ") or norm_ads.startswith("si("):
+            ads_line = clean_ads
+        else:
+            ads_line = f"SÍ ({clean_ads})"
     else:
-        ads_line = f"Orgánico ({clean_ads})" if clean_ads else "Orgánico."
+        if not clean_ads or norm_ads in {"no", "organico"}:
+            ads_line = "Orgánico."
+        elif norm_ads.startswith("organico"):
+            ads_line = clean_ads
+        else:
+            ads_line = f"Orgánico ({clean_ads})"
 
     lines = [
         doc_header,
@@ -1615,8 +1724,11 @@ def append_entry_to_monthly_doc(
     doc_id: str,
     entry_lines: list[str],
     credentials_path: Path | str | None = None,
+    *,
+    bold_prefixes: tuple[str, ...] | None = None,
 ) -> str:
     """Append an approved post entry to the end of `Pautas` (Docs API first, Drive HTML fallback)."""
+    resolved_prefixes = bold_prefixes if bold_prefixes is not None else _ENTRY_BOLD_PREFIXES
     plain_block = "\n" + "\n".join(entry_lines) + "\n"
 
     try:
@@ -1629,19 +1741,27 @@ def append_entry_to_monthly_doc(
         end_index = content[-1].get("endIndex", 1) if content else 1
         insert_index = max(1, end_index - 1)
 
+        requests: list[dict[str, Any]] = [
+            {
+                "insertText": {
+                    "location": {"index": insert_index},
+                    "text": plain_block,
+                }
+            }
+        ]
+        requests.extend(
+            _build_entry_style_requests(
+                entry_start=insert_index + 1,
+                entry_lines=entry_lines,
+                bold_prefixes=resolved_prefixes,
+                trailing_newlines=1,
+            )
+        )
+
         _execute_with_retry(
             docs_service.documents().batchUpdate(
                 documentId=doc_id,
-                body={
-                    "requests": [
-                        {
-                            "insertText": {
-                                "location": {"index": insert_index},
-                                "text": plain_block,
-                            }
-                        }
-                    ]
-                },
+                body={"requests": requests},
             ),
             f"docs_append({doc_id})",
         )
@@ -1668,15 +1788,8 @@ def append_entry_to_monthly_doc(
 
         new_paragraphs = _lines_to_html_paragraphs(
             [""] + entry_lines,
-            bold_prefixes=(
-                "Fecha:",
-                "Horario:",
-                "Pauta en Meta Ads:",
-                "Título / Gancho:",
-                "Caption:",
-                "Hashtags:",
-                "DM automático:",
-            ),
+            bold_prefixes=resolved_prefixes,
+            entry_header_as_h3=True,
         )
         if "</body>" in current_html:
             updated_html = current_html.replace("</body>", f"{new_paragraphs}</body>", 1)
@@ -2250,6 +2363,14 @@ def update_entry_in_monthly_doc(
                 }
             }
         )
+        requests.extend(
+            _build_entry_style_requests(
+                entry_start=start_index,
+                entry_lines=new_entry_lines,
+                bold_prefixes=_ENTRY_BOLD_PREFIXES,
+                trailing_newlines=1,
+            )
+        )
         _execute_with_retry(
             docs_service.documents().batchUpdate(
                 documentId=doc_id,
@@ -2316,6 +2437,7 @@ def update_entry_in_monthly_doc(
         replacement_html = _lines_to_html_paragraphs(
             new_entry_lines + [""],
             bold_prefixes=_ENTRY_BOLD_PREFIXES,
+            entry_header_as_h3=True,
         )
         updated_html = current_html[:replace_start] + replacement_html + current_html[replace_end:]
 
@@ -2823,6 +2945,16 @@ def append_or_create_scripts_doc(
     credentials_path: Path | str | None = None,
 ) -> tuple[str, bool]:
     """Append a generated script block to `Guiones` in `month_folder_id` (creating it if needed)."""
+    script_bold_prefixes = (
+        "Fecha:",
+        "Formato:",
+        "Gancho (0-3s):",
+        "Desarrollo (3-45s):",
+        "Cierre y CTA (45-60s):",
+        "Notas de grabación:",
+        "Caption:",
+        "Hashtags:",
+    )
     try:
         service = _get_drive_client(credentials_path)
         existing_id = _find_doc_by_title_ci(service, month_folder_id, doc_title)
@@ -2831,6 +2963,7 @@ def append_or_create_scripts_doc(
                 doc_id=existing_id,
                 entry_lines=script_lines,
                 credentials_path=credentials_path,
+                bold_prefixes=script_bold_prefixes,
             )
             return existing_id, False
 
@@ -2843,16 +2976,7 @@ def append_or_create_scripts_doc(
             folder_id=month_folder_id,
             doc_title=doc_title,
             plain_text_content=header_text,
-            bold_prefixes=(
-                "Fecha:",
-                "Formato:",
-                "Gancho (0-3s):",
-                "Desarrollo (3-45s):",
-                "Cierre y CTA (45-60s):",
-                "Notas de grabación:",
-                "Caption:",
-                "Hashtags:",
-            ),
+            bold_prefixes=script_bold_prefixes,
             credentials_path=credentials_path,
         )
     except HttpError as exc:
