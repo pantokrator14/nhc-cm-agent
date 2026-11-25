@@ -544,6 +544,73 @@ class TestDriveWeeksAndGuidelinesLogic(unittest.TestCase):
             self.assertEqual(drive_service.get_next_location_label(advance=True, state_path=Path(tmpdir) / "state.json"), "California")
             self.assertEqual(drive_service.get_next_location_label(advance=True, state_path=Path(tmpdir) / "state.json"), "California")
 
+    def test_move_unpublished_media_from_previous_month_moves_only_unpublished(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            sa_path = _write_sa_json(tmp)
+            state_path = tmp / "state.json"
+
+            # Seed state: pub_1 is PUBLISHED, pend_2 is ALREADY_IN_GUIDELINES, sched_3 is APPROVED
+            drive_service.mark_file_state("pub_1", "PUBLISHED", {"name": "01. Apertura.mp4"}, state_path)
+            drive_service.mark_file_state("pend_2", "ALREADY_IN_GUIDELINES", {"name": "14. orinar.mp4"}, state_path)
+            drive_service.mark_file_state("sched_3", "APPROVED", {"name": "15. EL SOL.mp4"}, state_path)
+
+            mock_drive = MagicMock()
+            # _find_subfolder_id calls for year="2026" and month="11"
+            mock_drive.files().list().execute.side_effect = [
+                {"files": [{"id": "y2026", "name": "2026"}]},
+                {"files": [{"id": "prev_11", "name": "11"}]},
+                # _list_folder_children_media(prev_11)
+                {
+                    "files": [
+                        {"id": "doc_pautas", "name": "Pautas", "mimeType": drive_service.GOOGLE_DOC_MIME_TYPE},
+                        {"id": "stats_dir", "name": "Estadísticas", "mimeType": drive_service.GOOGLE_FOLDER_MIME_TYPE},
+                        {"id": "pub_1", "name": "01. Apertura.mp4", "mimeType": "video/mp4"},
+                        {"id": "pend_2", "name": "14. orinar.mp4", "mimeType": "video/mp4"},
+                        {"id": "sched_3", "name": "15. EL SOL.mp4", "mimeType": "video/mp4"},
+                        {"id": "car_4", "name": "(CARRUSEL) Tips", "mimeType": drive_service.GOOGLE_FOLDER_MIME_TYPE},
+                    ]
+                },
+            ]
+            mock_drive.files().update().execute.return_value = {"id": "moved", "parents": ["new_12"]}
+
+            with patch.object(drive_service, "_get_drive_client", return_value=mock_drive), patch.object(
+                drive_service, "get_monthly_guidelines", side_effect=drive_service.DriveServiceError("no doc")
+            ):
+                res = drive_service.move_unpublished_media_from_previous_month(
+                    root_folder_id="root_1",
+                    new_month_folder_id="new_12",
+                    year_str="2026",
+                    month_str="12",
+                    state_path=state_path,
+                    credentials_path=sa_path,
+                )
+
+            self.assertEqual(res.previous_period, "2026/11")
+            self.assertEqual(
+                res.moved_names,
+                ["14. orinar.mp4", "15. EL SOL.mp4", "(CARRUSEL) Tips"],
+            )
+            self.assertEqual(res.scheduled_names, ["15. EL SOL.mp4"])
+            self.assertEqual(res.skipped_published_count, 1)
+
+            # ALREADY_IN_GUIDELINES was cleared so it can be re-evaluated in 2026/12; APPROVED stayed
+            new_state = drive_service.load_state(state_path)
+            self.assertNotIn("pend_2", new_state["files"])
+            self.assertEqual(new_state["files"]["sched_3"]["status"], "APPROVED")
+            self.assertIn("2026/12", new_state["rollover_months"])
+
+            # Idempotent: second call does nothing
+            res2 = drive_service.move_unpublished_media_from_previous_month(
+                root_folder_id="root_1",
+                new_month_folder_id="new_12",
+                year_str="2026",
+                month_str="12",
+                state_path=state_path,
+                credentials_path=sa_path,
+            )
+            self.assertEqual(res2.moved_names, [])
+
 
 if __name__ == "__main__":
     unittest.main()

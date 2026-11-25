@@ -400,6 +400,7 @@ def _empty_state() -> dict[str, Any]:
         "location_state": {"next_index": 0, "cache": {}},
         "scheduled_sessions": {},
         "performance_memory": {},
+        "rollover_months": {},
     }
 
 
@@ -434,6 +435,11 @@ def _normalize_state_shape(data: Any) -> dict[str, Any]:
         "performance_memory": (
             data["performance_memory"]
             if isinstance(data.get("performance_memory"), dict)
+            else {}
+        ),
+        "rollover_months": (
+            data["rollover_months"]
+            if isinstance(data.get("rollover_months"), dict)
             else {}
         ),
     }
@@ -1387,6 +1393,169 @@ def find_previous_month_guidelines_text(
         logger.warning("No se pudo obtener pautas del mes anterior: %s", exc)
 
     return None
+
+
+@dataclass(frozen=True, slots=True)
+class RolloverResult:
+    """Summary of unpublished media moved from the previous month into the newly created month."""
+
+    previous_period: str
+    moved_names: list[str]
+    scheduled_names: list[str]
+    skipped_published_count: int
+
+
+def move_unpublished_media_from_previous_month(
+    *,
+    root_folder_id: str,
+    new_month_folder_id: str,
+    year_str: str,
+    month_str: str,
+    state_path: Path | str | None = None,
+    credentials_path: Path | str | None = None,
+    lookback_months: int = 12,
+) -> RolloverResult:
+    """Move unpublished media files and `(CARRUSEL)` folders from the previous month to `new_month_folder_id`."""
+    period_key = f"{year_str.strip()}/{month_str.strip().zfill(2)}"
+    state = load_state(state_path)
+    if period_key in state.get("rollover_months", {}):
+        return RolloverResult(
+            previous_period="",
+            moved_names=[],
+            scheduled_names=[],
+            skipped_published_count=0,
+        )
+
+    service = _get_drive_client(credentials_path)
+    year = int(year_str)
+    month = int(month_str)
+    prev_month_folder_id: str | None = None
+    prev_period = ""
+
+    for _ in range(lookback_months):
+        month -= 1
+        if month < 1:
+            month = 12
+            year -= 1
+        prev_year_id = _find_subfolder_id(service, root_folder_id, str(year))
+        if not prev_year_id:
+            continue
+        candidate_id = _find_subfolder_id(service, prev_year_id, f"{month:02d}")
+        if candidate_id and candidate_id != new_month_folder_id:
+            prev_month_folder_id = candidate_id
+            prev_period = f"{year:04d}/{month:02d}"
+            break
+
+    if not prev_month_folder_id:
+        return RolloverResult(
+            previous_period="",
+            moved_names=[],
+            scheduled_names=[],
+            skipped_published_count=0,
+        )
+
+    children = _list_folder_children_media(service, prev_month_folder_id)
+    recorded_files: dict[str, Any] = state.get("files", {})
+    published_file_ids: set[str] = {
+        str(rec.get("file_id", "")).strip()
+        for rec in (state.get("media_posts") or {}).values()
+        if isinstance(rec, dict) and rec.get("file_id")
+    }
+    published_headers_clean = {
+        _normalize_match_text(_strip_published_marker(k))
+        for k in (state.get("published_guideline_headers") or {})
+    }
+
+    # Cross-check previous month's Pautas doc for `[PUBLICADO]` entries linked to files
+    try:
+        prev_guidelines_text = get_monthly_guidelines(
+            prev_month_folder_id,
+            credentials_path=credentials_path,
+        )
+        for entry in parse_guidelines_entries(prev_guidelines_text):
+            norm_h = _normalize_match_text(_strip_published_marker(entry.header))
+            if entry.is_marked_published or norm_h in published_headers_clean:
+                matched = _match_entry_to_drive_file(entry, children, recorded_files)
+                if matched and matched.get("id"):
+                    published_file_ids.add(str(matched["id"]))
+    except Exception:
+        pass
+
+    moved_names: list[str] = []
+    scheduled_names: list[str] = []
+    reset_file_ids: list[str] = []
+    skipped_published_count = 0
+
+    for item in children:
+        fid = str(item.get("id", "")).strip()
+        name = str(item.get("name", "")).strip()
+        if not fid:
+            continue
+
+        is_media = _is_supported_media(item)
+        is_carousel = item.get("mimeType") == GOOGLE_FOLDER_MIME_TYPE and is_carousel_folder_name(name)
+        if not (is_media or is_carousel):
+            continue
+
+        rec = recorded_files.get(fid, {}) if isinstance(recorded_files.get(fid), dict) else {}
+        local_status = str(rec.get("status", "")).upper()
+        drive_app_status = str((item.get("appProperties") or {}).get("status", "")).lower()
+        is_published_or_discarded = (
+            local_status in {"PUBLISHED", "DISCARDED"}
+            or drive_app_status == "published"
+            or bool(_PUBLISHED_HEADER_TAG_RE.search(name))
+            or fid in published_file_ids
+        )
+        if is_published_or_discarded:
+            skipped_published_count += 1
+            continue
+
+        _execute_with_retry(
+            service.files().update(
+                fileId=fid,
+                addParents=new_month_folder_id,
+                removeParents=prev_month_folder_id,
+                fields="id, parents",
+                supportsAllDrives=True,
+            ),
+            f"move_unpublished_to_new_month({fid})",
+        )
+        moved_names.append(name or fid)
+        if local_status == "APPROVED":
+            scheduled_names.append(name or fid)
+        elif local_status in {"ALREADY_IN_GUIDELINES", "PENDING_APPROVAL"}:
+            reset_file_ids.append(fid)
+
+    path = _get_state_path(state_path)
+    with _STATE_LOCK:
+        try:
+            fresh_state = _read_state_unlocked(path)
+        except DriveServiceError:
+            fresh_state = _empty_state()
+        for r_fid in reset_file_ids:
+            fresh_state["files"].pop(r_fid, None)
+        fresh_state["rollover_months"][period_key] = {
+            "from_period": prev_period,
+            "moved_names": moved_names,
+            "scheduled_names": scheduled_names,
+            "skipped_published_count": skipped_published_count,
+            "at": datetime.now(timezone.utc).isoformat(),
+        }
+        _save_state_unlocked(fresh_state, path)
+
+    logger.info(
+        "Cierre de mes (%s -> %s): %d archivo(s) no publicado(s) movido(s), %d publicado(s)/descartado(s) conservado(s).",
+        prev_period,
+        period_key,
+        len(moved_names),
+        skipped_published_count,
+    )
+    return RolloverResult(
+        previous_period=prev_period,
+        moved_names=moved_names,
+        scheduled_names=scheduled_names,
+        skipped_published_count=skipped_published_count,
+    )
 
 
 def _utf16_len(text: str) -> int:

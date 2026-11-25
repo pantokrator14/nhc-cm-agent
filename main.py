@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import logging
 import sys
 from datetime import datetime, timedelta
@@ -25,6 +26,7 @@ from drive_service import (
     get_monthly_guidelines,
     list_pending_files,
     mark_file_state,
+    move_unpublished_media_from_previous_month,
 )
 from gemini_agent import (
     classify_files_against_guidelines,
@@ -159,12 +161,43 @@ async def run_monthly_drive_review(
                 f"No se pudo crear automáticamente el documento 'Pautas' en {year_str}/{month_str}: {exc}"
             )
 
+        rollover_summary = ""
         if resolution.created or created_doc_id:
+            try:
+                rollover = await asyncio.to_thread(
+                    move_unpublished_media_from_previous_month,
+                    root_folder_id=settings.drive_root_folder_id,
+                    new_month_folder_id=month_folder_id,
+                    year_str=year_str,
+                    month_str=month_str,
+                    state_path=settings.state_file_path,
+                    credentials_path=settings.google_application_credentials,
+                )
+                if rollover.moved_names:
+                    preview = ", ".join(html.escape(n) for n in rollover.moved_names[:10])
+                    extra = (
+                        f" (+{len(rollover.moved_names) - 10} más)"
+                        if len(rollover.moved_names) > 10
+                        else ""
+                    )
+                    rollover_summary = (
+                        f"\n\n📦 <b>Contenido no publicado trasladado desde {html.escape(rollover.previous_period)}:</b> "
+                        f"<b>{len(rollover.moved_names)}</b> elemento(s) ({preview}{extra})."
+                    )
+            except Exception as rollover_exc:
+                logger.warning(
+                    "No se pudo trasladar contenido no publicado del mes anterior a %s/%s: %s",
+                    year_str,
+                    month_str,
+                    rollover_exc,
+                )
+
             drive_url = f"https://drive.google.com/drive/folders/{month_folder_id}"
             await bot_controller.notify_info(
                 f"👋 <b>¡Hola! Ha iniciado otro mes (<code>{year_str}/{month_str}</code>)</b> "
                 "y ya he creado la carpeta correspondiente junto con el documento <b>Pautas</b> "
-                "(tomando el mes anterior como referencia de formato y marca).\n\n"
+                "(tomando el mes anterior como referencia de formato y marca)."
+                f"{rollover_summary}\n\n"
                 "📤 Sube los archivos multimedia que tengas a dicha carpeta para analizarlos y hacer sus propuestas de pautas.\n\n"
                 f"🔗 <a href=\"{drive_url}\">Abrir carpeta {year_str}/{month_str} en Google Drive</a>"
             )
