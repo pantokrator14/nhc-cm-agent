@@ -121,6 +121,7 @@ def _default_fallback_targeting() -> dict[str, Any]:
         "age_max": 54,
         "publisher_platforms": ["instagram"],
         "instagram_positions": ["stream", "reels", "story", "explore"],
+        "targeting_automation": {"advantage_audience": 0},
     }
 
 
@@ -169,6 +170,59 @@ async def _inspect_ad_account_billing(
     return "Sin detalle visible (Meta cobrará al método principal configurado si existe)"
 
 
+def _sanitize_saved_targeting(raw_targeting: dict[str, Any]) -> dict[str, Any]:
+    """Strip non-IG / read-only saved-audience fields and normalize Advantage+ flags for v21."""
+    targeting = dict(raw_targeting)
+    for drop_key in (
+        "facebook_positions",
+        "messenger_positions",
+        "audience_network_positions",
+        "effective_audience_network_positions",
+        "effective_facebook_positions",
+        "effective_messenger_positions",
+        "device_platforms",
+        "targeting_optimization",
+        "brand_safety_content_filter_levels",
+        "is_saved_audience",
+    ):
+        targeting.pop(drop_key, None)
+
+    targeting["publisher_platforms"] = ["instagram"]
+    targeting.setdefault("instagram_positions", ["stream", "reels", "story", "explore"])
+    # Explicit age_max < 65 or saved demographic specs require advantage_audience=0 in v21+
+    targeting["targeting_automation"] = {"advantage_audience": 0}
+    return targeting
+
+
+def _minimal_ig_targeting_from(raw_targeting: dict[str, Any]) -> dict[str, Any]:
+    """Build a minimal v21-safe IG targeting dict preserving core demographic keys."""
+    minimal: dict[str, Any] = {
+        "geo_locations": raw_targeting.get("geo_locations") or {"countries": DEFAULT_ADS_COUNTRIES},
+        "publisher_platforms": ["instagram"],
+        "instagram_positions": ["stream", "reels", "story", "explore"],
+        "targeting_automation": {"advantage_audience": 0},
+    }
+    for key in ("genders", "age_min", "age_max", "locales"):
+        if key in raw_targeting and raw_targeting[key] is not None:
+            minimal[key] = raw_targeting[key]
+    return minimal
+
+
+async def _cleanup_empty_campaign(
+    client: httpx.AsyncClient,
+    campaign_id: str,
+    access_token: str,
+) -> None:
+    """Best-effort delete of an orphan campaign when AdSet/Creative/Ad creation fails."""
+    try:
+        await client.post(
+            f"{GRAPH_API_BASE_URL}/{campaign_id}",
+            data={"status": "DELETED", "access_token": access_token},
+        )
+    except Exception:
+        pass
+
+
 async def _resolve_saved_audience_targeting(
     client: httpx.AsyncClient,
     normalized_act: str,
@@ -215,17 +269,7 @@ async def _resolve_saved_audience_targeting(
         )
         return _default_fallback_targeting(), f"Predeterminado (no se encontró '{audience_name}')"
 
-    targeting = dict(matched["targeting"])
-    for non_ig_key in (
-        "facebook_positions",
-        "messenger_positions",
-        "audience_network_positions",
-        "device_platforms",
-    ):
-        targeting.pop(non_ig_key, None)
-
-    targeting["publisher_platforms"] = ["instagram"]
-    targeting.setdefault("instagram_positions", ["stream", "reels", "story", "explore"])
+    targeting = _sanitize_saved_targeting(matched["targeting"])
 
     matched_name = str(matched.get("name", audience_name))
     matched_id = str(matched.get("id", ""))
@@ -306,27 +350,44 @@ async def promote_instagram_post(
             )
         campaign_id = str(camp_resp.json()["id"])
 
-        # 2. AdSet
+        # 2. AdSet (OUTCOME_ENGAGEMENT + POST_ENGAGEMENT requires ON_POST + promoted_object.page_id in v21+)
+        adset_payload = {
+            "name": f"NHC AdSet - {clean_name}",
+            "campaign_id": campaign_id,
+            "daily_budget": str(daily_budget_cents),
+            "billing_event": "IMPRESSIONS",
+            "optimization_goal": "POST_ENGAGEMENT",
+            "destination_type": "ON_POST",
+            "promoted_object": json.dumps({"page_id": page_id}),
+            "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
+            "start_time": start_time,
+            "end_time": end_time,
+            "targeting": json.dumps(targeting),
+            "status": "ACTIVE",
+            "access_token": access_token,
+        }
         adset_resp = await client.post(
             f"{GRAPH_API_BASE_URL}/{normalized_act}/adsets",
-            data={
-                "name": f"NHC AdSet - {clean_name}",
-                "campaign_id": campaign_id,
-                "daily_budget": str(daily_budget_cents),
-                "billing_event": "IMPRESSIONS",
-                "optimization_goal": "POST_ENGAGEMENT",
-                "bid_strategy": "LOWEST_COST_WITHOUT_CAP",
-                "start_time": start_time,
-                "end_time": end_time,
-                "targeting": json.dumps(targeting),
-                "status": "ACTIVE",
-                "access_token": access_token,
-            },
+            data=adset_payload,
         )
         if adset_resp.is_error:
+            first_err = _extract_meta_error(adset_resp)
+            minimal_targeting = _minimal_ig_targeting_from(targeting)
+            if minimal_targeting != targeting:
+                logger.warning(
+                    "Meta rechazó AdSet con targeting completo (%s); reintentando con targeting demográfico limpio.",
+                    first_err,
+                )
+                retry_payload = {**adset_payload, "targeting": json.dumps(minimal_targeting)}
+                adset_resp = await client.post(
+                    f"{GRAPH_API_BASE_URL}/{normalized_act}/adsets",
+                    data=retry_payload,
+                )
+        if adset_resp.is_error:
+            err_msg = _extract_meta_error(adset_resp)
+            await _cleanup_empty_campaign(client, campaign_id, access_token)
             raise MetaAdsError(
-                f"Error creando AdSet en Meta Ads (campaign_id={campaign_id}): "
-                f"{_extract_meta_error(adset_resp)}"
+                f"Error creando AdSet en Meta Ads (campaign_id={campaign_id}): {err_msg}"
             )
         adset_id = str(adset_resp.json()["id"])
 
@@ -342,9 +403,10 @@ async def promote_instagram_post(
             },
         )
         if creative_resp.is_error:
+            err_msg = _extract_meta_error(creative_resp)
+            await _cleanup_empty_campaign(client, campaign_id, access_token)
             raise MetaAdsError(
-                f"Error creando AdCreative en Meta Ads (adset_id={adset_id}): "
-                f"{_extract_meta_error(creative_resp)}"
+                f"Error creando AdCreative en Meta Ads (adset_id={adset_id}): {err_msg}"
             )
         creative_id = str(creative_resp.json()["id"])
 
@@ -360,9 +422,10 @@ async def promote_instagram_post(
             },
         )
         if ad_resp.is_error:
+            err_msg = _extract_meta_error(ad_resp)
+            await _cleanup_empty_campaign(client, campaign_id, access_token)
             raise MetaAdsError(
-                f"Error creando Ad en Meta Ads (creative_id={creative_id}): "
-                f"{_extract_meta_error(ad_resp)}"
+                f"Error creando Ad en Meta Ads (creative_id={creative_id}): {err_msg}"
             )
         ad_id = str(ad_resp.json()["id"])
 

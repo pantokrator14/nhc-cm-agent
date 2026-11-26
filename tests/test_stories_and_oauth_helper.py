@@ -139,7 +139,23 @@ class TestStoryTelegramDisplayAndBuild(unittest.TestCase):
             self.assertIn("Historia IG (24h)", card_html)
             self.assertIn("STORIES", card_html)
             self.assertIn("las Historias de Instagram no se publican en TikTok", card_html)
+            self.assertIn("Nota / Comentario opcional", card_html)
+            self.assertNotIn("Caption sugerido", card_html)
             self.assertNotIn("Ubicación (IG)", card_html)
+
+            story_lines = drive_service.format_guideline_entry_lines(
+                doc_header="Historia 1: Orinar",
+                scheduled_dt=datetime(2026, 11, 24, 10, 0, tzinfo=timezone.utc),
+                promote_in_ads=False,
+                ads_recommendation="No aplica",
+                hook_title="Escucha tu cuerpo",
+                caption="Sticker de encuesta en pantalla",
+                hashtags="",
+                is_story=True,
+            )
+            self.assertFalse(any(l.startswith("Caption:") for l in story_lines))
+            self.assertFalse(any(l.startswith("Hashtags:") for l in story_lines))
+            self.assertIn("Nota / Comentario: Sticker de encuesta en pantalla", story_lines)
 
 
 class TestGoogleOAuthSetupHelper(unittest.TestCase):

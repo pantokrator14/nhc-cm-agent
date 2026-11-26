@@ -1874,11 +1874,13 @@ def format_guideline_entry_lines(
     has_keyword_cta: bool = False,
     keyword: str = "",
     target_link: str = "",
+    is_story: bool = False,
 ) -> list[str]:
     """Format an approved proposal into the exact multi-line structure used in `Pautas`."""
     weekday_name = SPANISH_WEEKDAYS[scheduled_dt.weekday()]
     fecha_str = f"{weekday_name} {scheduled_dt.strftime('%d/%m/%Y')}"
     horario_str = f"{scheduled_dt.strftime('%H:%M')} hrs"
+    story_mode = is_story or bool(re.match(r"^Historia\s+\d+\s*:", doc_header.strip(), flags=re.IGNORECASE))
 
     clean_ads = ads_recommendation.strip()
     norm_ads = _normalize_match_text(clean_ads)
@@ -1903,10 +1905,25 @@ def format_guideline_entry_lines(
         f"Horario: {horario_str}",
         f"Pauta en Meta Ads: {ads_line}",
         f"Título / Gancho: {hook_title.strip()}",
-        "Caption:",
-        *[line for line in caption.strip().splitlines()],
-        f"Hashtags: {hashtags.strip()}",
     ]
+    if story_mode:
+        note_clean = caption.strip()
+        if note_clean:
+            note_lines = [ln.strip() for ln in note_clean.splitlines() if ln.strip()]
+            if len(note_lines) == 1:
+                lines.append(f"Nota / Comentario: {note_lines[0]}")
+            else:
+                lines.append("Nota / Comentario:")
+                lines.extend(note_lines)
+        return lines
+
+    lines.extend(
+        [
+            "Caption:",
+            *[line for line in caption.strip().splitlines()],
+            f"Hashtags: {hashtags.strip()}",
+        ]
+    )
     if has_keyword_cta and keyword.strip():
         dm_detail = f"Palabra clave '{keyword.strip().upper()}'"
         if target_link.strip():
@@ -2115,6 +2132,7 @@ _ENTRY_BOLD_PREFIXES = (
     "Pauta en Meta Ads:",
     "Título / Gancho:",
     "Caption:",
+    "Nota / Comentario:",
     "Hashtags:",
     "DM automático:",
 )
@@ -2269,7 +2287,7 @@ def parse_guidelines_entries(
             elif lower_s.startswith("titulo / gancho:") or lower_s.startswith("titulo/gancho:"):
                 in_caption = False
                 hook_title = s.split(":", 1)[1].strip()
-            elif lower_s.startswith("caption:"):
+            elif lower_s.startswith("caption:") or lower_s.startswith("nota / comentario:") or lower_s.startswith("nota/comentario:"):
                 in_caption = True
                 rest = s.split(":", 1)[1].strip()
                 if rest:

@@ -43,7 +43,16 @@ def _extract_meta_error(response: httpx.Response) -> str:
         message = error.get("message", "Error desconocido")
         code = error.get("code")
         subcode = error.get("error_subcode")
-        return f"{message} (code={code}, subcode={subcode})"
+        details: list[str] = []
+        user_title = str(error.get("error_user_title", "") or "").strip()
+        user_msg = str(error.get("error_user_msg", "") or "").strip()
+        if user_title or user_msg:
+            details.append(" — ".join(p for p in (user_title, user_msg) if p))
+        err_data = error.get("error_data")
+        if isinstance(err_data, dict) and err_data.get("blame_field_specs"):
+            details.append(f"campos={err_data['blame_field_specs']}")
+        extra = f" | {'; '.join(details)}" if details else ""
+        return f"{message} (code={code}, subcode={subcode}){extra}"
     return str(payload)
 
 

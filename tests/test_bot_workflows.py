@@ -440,6 +440,101 @@ class TestMetricsArgsAndDmPolling(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(entries[0].scheduled_dt.hour, 19)
             self.assertEqual(entries[0].scheduled_dt.utcoffset().total_seconds(), -4 * 3600)
 
+    async def test_promote_instagram_post_includes_on_post_promoted_object_and_retries_clean_targeting(self) -> None:
+        from meta_ads_service import promote_instagram_post
+
+        def _resp(status: int, payload: dict) -> MagicMock:
+            r = MagicMock()
+            r.status_code = status
+            r.is_error = status >= 400
+            r.json.return_value = payload
+            r.text = json.dumps(payload)
+            return r
+
+        adset_posts: list[dict] = []
+
+        async def _mock_get(url: str, params: dict | None = None):
+            if url.endswith("/act_111"):
+                return _resp(200, {"id": "act_111", "account_status": 1, "funding_source": "card_1"})
+            if "/boost_eligibility_info" in url or (params and params.get("fields") == "boost_eligibility_info"):
+                return _resp(200, {"boost_eligibility_info": {"eligible_to_boost": True}})
+            if url.endswith("/saved_audiences"):
+                return _resp(
+                    200,
+                    {
+                        "data": [
+                            {
+                                "id": "aud_1",
+                                "name": "mujeres",
+                                "targeting": {
+                                    "geo_locations": {"countries": ["US"]},
+                                    "genders": [2],
+                                    "age_min": 25,
+                                    "age_max": 54,
+                                    "targeting_optimization": "expansion_all",
+                                    "flexible_spec": [{"interests": [{"id": "123", "name": "Health"}]}],
+                                },
+                            }
+                        ]
+                    },
+                )
+            if url.endswith("/me/accounts"):
+                return _resp(200, {"data": [{"id": "page_77", "instagram_business_account": {"id": "ig-123"}}]})
+            raise AssertionError(f"Unexpected GET {url}")
+
+        async def _mock_post(url: str, data: dict | None = None):
+            if url.endswith("/campaigns"):
+                return _resp(200, {"id": "camp_1"})
+            if url.endswith("/adsets"):
+                adset_posts.append(dict(data or {}))
+                if len(adset_posts) == 1:
+                    return _resp(
+                        400,
+                        {
+                            "error": {
+                                "message": "Invalid parameter",
+                                "code": 100,
+                                "error_subcode": 2490589,
+                                "error_user_msg": "Targeting spec invalid",
+                            }
+                        },
+                    )
+                return _resp(200, {"id": "adset_1"})
+            if url.endswith("/adcreatives"):
+                return _resp(200, {"id": "creat_1"})
+            if url.endswith("/ads"):
+                return _resp(200, {"id": "ad_1"})
+            raise AssertionError(f"Unexpected POST {url}")
+
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(side_effect=_mock_get)
+        mock_client.post = AsyncMock(side_effect=_mock_post)
+        cm = MagicMock()
+        cm.__aenter__ = AsyncMock(return_value=mock_client)
+        cm.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("meta_ads_service.httpx.AsyncClient", return_value=cm):
+            res = await promote_instagram_post(
+                access_token="tok",
+                ig_user_id="ig-123",
+                ad_account_id="act_111",
+                ig_media_id="media_9",
+                post_name="Orinar",
+                daily_budget_usd=4.0,
+                duration_days=5,
+            )
+
+        self.assertEqual(res.ad_id, "ad_1")
+        self.assertEqual(len(adset_posts), 2)
+        self.assertEqual(adset_posts[0]["destination_type"], "ON_POST")
+        self.assertEqual(json.loads(adset_posts[0]["promoted_object"]), {"page_id": "page_77"})
+        first_targeting = json.loads(adset_posts[0]["targeting"])
+        self.assertNotIn("targeting_optimization", first_targeting)
+        self.assertEqual(first_targeting["targeting_automation"], {"advantage_audience": 0})
+        retry_targeting = json.loads(adset_posts[1]["targeting"])
+        self.assertNotIn("flexible_spec", retry_targeting)
+        self.assertEqual(retry_targeting["genders"], [2])
+
     async def test_fetch_dm_messages_resolves_linked_page_and_skips_answered_threads(self) -> None:
         from meta_publisher import fetch_instagram_dm_messages_with_status
 

@@ -402,34 +402,59 @@ def _format_proposal_html(
         else ""
     )
 
-    meta_block = (
-        f"<b>{html.escape(header)}</b>\n\n"
-        + note_block
-        + doc_line
-        + f"📁 <b>Archivo:</b> <code>{filename}</code>\n"
-        + carousel_line
-        + tech_line
-        + f"🎥 <b>Contenido analizado:</b> <i>{content_summary}</i>\n"
-        f"🏷️ <b>Cadencia / Título:</b> {category_label} — {short_title}\n"
-        f"🎬 <b>Formato:</b> {media_type}\n"
-        + location_line
-        + f"🕒 <b>Fecha y hora sugerida:</b> <code>{scheduled_time}</code>\n"
-        + (f"   <i>{schedule_reasoning}</i>\n" if schedule_reasoning else "")
-        + (f"📈 <b>Tendencia aplicada:</b> <i>{trend_alignment}</i>\n" if trend_alignment else "")
-        + f"🎯 <b>Gancho / Título:</b> {hook_title}\n"
-        f"📣 <b>Meta Ads (IG):</b> {html.escape(ads_badge)}\n"
-        + (f"   <i>{ads_detail}</i>\n" if ads_detail else "")
-        + f"🎵 <b>TikTok (Orgánico):</b> {html.escape(tiktok_badge)}\n"
-        f"🔑 <b>Palabra clave (IG):</b> <code>{keyword_display}</code>\n"
-        f"🔗 <b>Enlace DM:</b> {link_display}\n"
-        f"💬 <b>Respuesta pública:</b> {reply_display}\n\n"
-        f"📝 <b>Caption sugerido:</b>\n"
-    )
-    hashtags_block = (
-        f"\n\n🏷️ <b>Hashtags ({len(hashtag_list)}/{MAX_INSTAGRAM_HASHTAGS}):</b>\n{hashtags}"
-        if hashtags
-        else ""
-    )
+    if p.media_type == "STORIES":
+        meta_block = (
+            f"<b>{html.escape(header)}</b>\n\n"
+            + note_block
+            + doc_line
+            + f"📁 <b>Archivo:</b> <code>{filename}</code>\n"
+            + tech_line
+            + f"🎥 <b>Contenido analizado:</b> <i>{content_summary}</i>\n"
+            f"🏷️ <b>Cadencia / Título:</b> {category_label} — {short_title}\n"
+            f"🎬 <b>Formato:</b> {media_type}\n"
+            f"🕒 <b>Fecha y hora sugerida:</b> <code>{scheduled_time}</code>\n"
+            + (f"   <i>{schedule_reasoning}</i>\n" if schedule_reasoning else "")
+            + (f"📈 <b>Tendencia aplicada:</b> <i>{trend_alignment}</i>\n" if trend_alignment else "")
+            + f"🎯 <b>Gancho / Título:</b> {hook_title}\n"
+            f"📣 <b>Meta Ads (IG):</b> {html.escape(ads_badge)}\n"
+            + (f"   <i>{ads_detail}</i>\n" if ads_detail else "")
+            + f"🎵 <b>TikTok (Orgánico):</b> {html.escape(tiktok_badge)}\n\n"
+            + (
+                "💬 <b>Nota / Comentario opcional (las Historias no llevan caption):</b>\n"
+                if caption
+                else "ℹ️ <i>Historia de 24h (sin caption ni hashtags).</i>"
+            )
+        )
+        hashtags_block = ""
+    else:
+        meta_block = (
+            f"<b>{html.escape(header)}</b>\n\n"
+            + note_block
+            + doc_line
+            + f"📁 <b>Archivo:</b> <code>{filename}</code>\n"
+            + carousel_line
+            + tech_line
+            + f"🎥 <b>Contenido analizado:</b> <i>{content_summary}</i>\n"
+            f"🏷️ <b>Cadencia / Título:</b> {category_label} — {short_title}\n"
+            f"🎬 <b>Formato:</b> {media_type}\n"
+            + location_line
+            + f"🕒 <b>Fecha y hora sugerida:</b> <code>{scheduled_time}</code>\n"
+            + (f"   <i>{schedule_reasoning}</i>\n" if schedule_reasoning else "")
+            + (f"📈 <b>Tendencia aplicada:</b> <i>{trend_alignment}</i>\n" if trend_alignment else "")
+            + f"🎯 <b>Gancho / Título:</b> {hook_title}\n"
+            f"📣 <b>Meta Ads (IG):</b> {html.escape(ads_badge)}\n"
+            + (f"   <i>{ads_detail}</i>\n" if ads_detail else "")
+            + f"🎵 <b>TikTok (Orgánico):</b> {html.escape(tiktok_badge)}\n"
+            f"🔑 <b>Palabra clave (IG):</b> <code>{keyword_display}</code>\n"
+            f"🔗 <b>Enlace DM:</b> {link_display}\n"
+            f"💬 <b>Respuesta pública:</b> {reply_display}\n\n"
+            f"📝 <b>Caption sugerido:</b>\n"
+        )
+        hashtags_block = (
+            f"\n\n🏷️ <b>Hashtags ({len(hashtag_list)}/{MAX_INSTAGRAM_HASHTAGS}):</b>\n{hashtags}"
+            if hashtags
+            else ""
+        )
     text = meta_block + caption + hashtags_block
 
     if len(text) > TELEGRAM_MAX_MESSAGE_LENGTH:
@@ -1394,6 +1419,7 @@ class NelHealthCoachBot:
                 has_keyword_cta=p.has_keyword_cta,
                 keyword=p.keyword,
                 target_link=p.target_link,
+                is_story=(p.media_type == "STORIES"),
             )
             if session.is_existing_guideline and session.existing_doc_header:
                 update_entry_in_monthly_doc(
