@@ -1884,7 +1884,9 @@ def format_guideline_entry_lines(
 
     clean_ads = ads_recommendation.strip()
     norm_ads = _normalize_match_text(clean_ads)
-    if promote_in_ads:
+    if story_mode and not promote_in_ads:
+        ads_line = "No aplica (Historia de 24h en Instagram)."
+    elif promote_in_ads:
         if not clean_ads or norm_ads in {"si", "sí"}:
             ads_line = "SÍ"
         elif norm_ads.startswith("si ") or norm_ads.startswith("si("):
@@ -1892,7 +1894,7 @@ def format_guideline_entry_lines(
         else:
             ads_line = f"SÍ ({clean_ads})"
     else:
-        if not clean_ads or norm_ads in {"no", "organico"}:
+        if not clean_ads or norm_ads in {"no", "organico"} or norm_ads.startswith("no aplica"):
             ads_line = "Orgánico."
         elif norm_ads.startswith("organico"):
             ads_line = clean_ads
@@ -1932,16 +1934,93 @@ def format_guideline_entry_lines(
     return lines
 
 
+def _parse_entry_lines_dt(entry_lines: list[str]) -> datetime | None:
+    """Extract scheduled `(Fecha, Horario)` datetime from a formatted entry block."""
+    fecha_raw = ""
+    horario_raw = ""
+    for line in entry_lines:
+        stripped = line.strip()
+        norm = _normalize_match_text(stripped)
+        if norm.startswith("fecha:"):
+            fecha_raw = stripped.split(":", 1)[1].strip()
+        elif norm.startswith("horario:"):
+            horario_raw = stripped.split(":", 1)[1].strip()
+    if not fecha_raw:
+        return None
+    return _parse_fecha_horario(fecha_raw, horario_raw)
+
+
+@dataclass(frozen=True, slots=True)
+class _DocEntrySpan:
+    start_index: int
+    end_index: int
+    header: str
+    scheduled_dt: datetime | None
+
+
+def _extract_doc_paragraphs_and_entries(
+    doc: dict[str, Any],
+) -> tuple[int, list[tuple[int, int, str]], list[_DocEntrySpan]]:
+    """Extract body paragraphs and chronological entry spans from a Google Docs document."""
+    content = doc.get("body", {}).get("content", [])
+    doc_end_index = content[-1].get("endIndex", 1) if content else 1
+
+    paragraphs: list[tuple[int, int, str]] = []
+    for elem in content:
+        para = elem.get("paragraph")
+        if not para:
+            continue
+        start_i = int(elem.get("startIndex", 0))
+        end_i = int(elem.get("endIndex", 0))
+        text_parts = [
+            el.get("textRun", {}).get("content", "")
+            for el in para.get("elements", [])
+        ]
+        paragraphs.append((start_i, end_i, "".join(text_parts).strip()))
+
+    search_from = 0
+    for idx, (_, _, ptext) in enumerate(paragraphs):
+        if re.match(r"^===\s*PAUTAS DEL MES\b", ptext, re.IGNORECASE):
+            search_from = idx + 1
+            break
+
+    header_indices = [
+        idx
+        for idx in range(search_from, len(paragraphs))
+        if _match_entry_header(paragraphs[idx][2]) is not None
+    ]
+    spans: list[_DocEntrySpan] = []
+    for pos, h_idx in enumerate(header_indices):
+        span_start = paragraphs[h_idx][0]
+        span_end = (
+            paragraphs[header_indices[pos + 1]][0]
+            if pos + 1 < len(header_indices)
+            else max(span_start + 1, doc_end_index - 1)
+        )
+        block_end_para = header_indices[pos + 1] if pos + 1 < len(header_indices) else len(paragraphs)
+        block_texts = [paragraphs[i][2] for i in range(h_idx, block_end_para)]
+        spans.append(
+            _DocEntrySpan(
+                start_index=span_start,
+                end_index=span_end,
+                header=paragraphs[h_idx][2],
+                scheduled_dt=_parse_entry_lines_dt(block_texts),
+            )
+        )
+    return doc_end_index, paragraphs, spans
+
+
 def append_entry_to_monthly_doc(
     doc_id: str,
     entry_lines: list[str],
     credentials_path: Path | str | None = None,
     *,
     bold_prefixes: tuple[str, ...] | None = None,
+    sort_chronologically: bool = True,
 ) -> str:
-    """Append an approved post entry to the end of `Pautas` (Docs API first, Drive HTML fallback)."""
+    """Insert an approved post entry in chronological `(Fecha, Horario)` order inside `Pautas`."""
     resolved_prefixes = bold_prefixes if bold_prefixes is not None else _ENTRY_BOLD_PREFIXES
-    plain_block = "\n" + "\n".join(entry_lines) + "\n"
+    new_dt = _parse_entry_lines_dt(entry_lines) if sort_chronologically else None
 
     try:
         docs_service = _get_docs_client(credentials_path)
@@ -1949,9 +2028,29 @@ def append_entry_to_monthly_doc(
             docs_service.documents().get(documentId=doc_id),
             f"docs_get({doc_id})",
         )
-        content = doc.get("body", {}).get("content", [])
-        end_index = content[-1].get("endIndex", 1) if content else 1
-        insert_index = max(1, end_index - 1)
+        end_index, paragraphs, spans = _extract_doc_paragraphs_and_entries(doc)
+        target_span = (
+            next(
+                (s for s in spans if s.scheduled_dt is not None and s.scheduled_dt > new_dt),
+                None,
+            )
+            if new_dt is not None
+            else None
+        )
+
+        if target_span is not None:
+            insert_index = target_span.start_index
+            plain_block = "\n".join(entry_lines) + "\n\n"
+            entry_start = insert_index
+        else:
+            insert_index = max(1, end_index - 1)
+            prev_text = paragraphs[-1][2] if paragraphs else ""
+            if prev_text:
+                plain_block = "\n" + "\n".join(entry_lines) + "\n"
+                entry_start = insert_index + 1
+            else:
+                plain_block = "\n".join(entry_lines) + "\n\n"
+                entry_start = insert_index
 
         requests: list[dict[str, Any]] = [
             {
@@ -1963,7 +2062,7 @@ def append_entry_to_monthly_doc(
         ]
         requests.extend(
             _build_entry_style_requests(
-                entry_start=insert_index + 1,
+                entry_start=entry_start,
                 entry_lines=entry_lines,
                 bold_prefixes=resolved_prefixes,
                 trailing_newlines=1,
@@ -2502,10 +2601,12 @@ def update_entry_in_monthly_doc(
     target_header: str,
     new_entry_lines: list[str],
     credentials_path: Path | str | None = None,
+    *,
+    sort_chronologically: bool = True,
 ) -> str:
-    """Replace an existing entry block inside `Pautas` in-place (Docs API first, Drive HTML fallback)."""
+    """Replace an existing entry in `Pautas` and reposition it chronologically by `(Fecha, Horario)`."""
     norm_target = _normalize_match_text(target_header)
-    new_block = "\n".join(new_entry_lines) + "\n\n"
+    new_dt = _parse_entry_lines_dt(new_entry_lines) if sort_chronologically else None
 
     try:
         docs_service = _get_docs_client(credentials_path)
@@ -2513,51 +2614,62 @@ def update_entry_in_monthly_doc(
             docs_service.documents().get(documentId=doc_id),
             f"docs_get_for_update({doc_id})",
         )
-        content = doc.get("body", {}).get("content", [])
-        doc_end_index = content[-1].get("endIndex", 1) if content else 1
-
-        paragraphs: list[tuple[int, int, str]] = []
-        for elem in content:
-            para = elem.get("paragraph")
-            if not para:
-                continue
-            start_i = int(elem.get("startIndex", 0))
-            end_i = int(elem.get("endIndex", 0))
-            text_parts = [
-                el.get("textRun", {}).get("content", "")
-                for el in para.get("elements", [])
-            ]
-            para_text = "".join(text_parts).strip()
-            paragraphs.append((start_i, end_i, para_text))
-
-        # Respect `=== PAUTAS DEL MES` divider if present
-        search_from = 0
-        for idx, (_, _, ptext) in enumerate(paragraphs):
-            if re.match(r"^===\s*PAUTAS DEL MES\b", ptext, re.IGNORECASE):
-                search_from = idx + 1
-                break
-
-        found_idx: int | None = None
-        for idx in range(search_from, len(paragraphs)):
-            if _normalize_match_text(paragraphs[idx][2]) == norm_target:
-                found_idx = idx
-                break
-
-        if found_idx is None:
+        doc_end_index, paragraphs, spans = _extract_doc_paragraphs_and_entries(doc)
+        target_span = next(
+            (s for s in spans if _normalize_match_text(s.header) == norm_target),
+            None,
+        )
+        if target_span is None:
             raise DriveServiceError(
                 f"No se encontró la pauta '{target_header}' en el documento {doc_id}."
             )
 
-        start_index = paragraphs[found_idx][0]
-        end_index = doc_end_index - 1
-        for idx in range(found_idx + 1, len(paragraphs)):
-            if _match_entry_header(paragraphs[idx][2]) is not None:
-                end_index = paragraphs[idx][0]
-                break
+        start_index = target_span.start_index
+        safe_end_index = min(target_span.end_index, max(start_index + 1, doc_end_index - 1))
+        deleted_len = max(0, safe_end_index - start_index)
 
-        safe_end_index = min(end_index, max(start_index + 1, doc_end_index - 1))
+        remaining_spans = [s for s in spans if s is not target_span]
+        next_span = (
+            next(
+                (s for s in remaining_spans if s.scheduled_dt is not None and s.scheduled_dt > new_dt),
+                None,
+            )
+            if new_dt is not None
+            else None
+        )
+
+        if not sort_chronologically or new_dt is None:
+            raw_insert_index = start_index
+            new_block = "\n".join(new_entry_lines) + "\n\n"
+            entry_offset = 0
+        elif next_span is not None:
+            raw_insert_index = next_span.start_index
+            new_block = "\n".join(new_entry_lines) + "\n\n"
+            entry_offset = 0
+        else:
+            raw_insert_index = max(1, doc_end_index - 1)
+            # Check whether the last remaining paragraph before doc end is non-empty
+            last_remaining_text = ""
+            for p_start, _, p_text in reversed(paragraphs):
+                if start_index <= p_start < safe_end_index:
+                    continue
+                last_remaining_text = p_text
+                break
+            if remaining_spans and last_remaining_text:
+                new_block = "\n" + "\n".join(new_entry_lines) + "\n"
+                entry_offset = 1
+            else:
+                new_block = "\n".join(new_entry_lines) + "\n\n"
+                entry_offset = 0
+
+        insert_index = (
+            raw_insert_index - deleted_len
+            if raw_insert_index > start_index
+            else raw_insert_index
+        )
+
         requests: list[dict[str, Any]] = []
-        if safe_end_index > start_index:
+        if deleted_len > 0:
             requests.append(
                 {
                     "deleteContentRange": {
@@ -2571,14 +2683,14 @@ def update_entry_in_monthly_doc(
         requests.append(
             {
                 "insertText": {
-                    "location": {"index": start_index},
+                    "location": {"index": insert_index},
                     "text": new_block,
                 }
             }
         )
         requests.extend(
             _build_entry_style_requests(
-                entry_start=start_index,
+                entry_start=insert_index + entry_offset,
                 entry_lines=new_entry_lines,
                 bold_prefixes=_ENTRY_BOLD_PREFIXES,
                 trailing_newlines=1,
@@ -2616,7 +2728,13 @@ def update_entry_in_monthly_doc(
         )
         current_html = html_bytes.decode("utf-8")
 
-        p_matches = list(re.finditer(r"<p\b[^>]*>.*?</p>", current_html, flags=re.DOTALL | re.IGNORECASE))
+        p_matches = list(
+            re.finditer(
+                r"<(?:p|h[1-6])\b[^>]*>.*?</(?:p|h[1-6])>",
+                current_html,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+        )
         p_texts = [
             html_lib.unescape(re.sub(r"<[^>]+>", "", m.group(0))).strip()
             for m in p_matches
@@ -3177,6 +3295,7 @@ def append_or_create_scripts_doc(
                 entry_lines=script_lines,
                 credentials_path=credentials_path,
                 bold_prefixes=script_bold_prefixes,
+                sort_chronologically=False,
             )
             return existing_id, False
 

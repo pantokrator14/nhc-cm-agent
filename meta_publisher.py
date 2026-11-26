@@ -885,69 +885,82 @@ async def _resolve_linked_page_credentials(
         return None
 
 
-async def fetch_instagram_dm_messages_with_status(
+async def fetch_instagram_dm_messages_detailed(
     ig_user_id: str,
     access_token: str,
     *,
     limit_conversations: int = 20,
     since_minutes: int = 4320,
-) -> tuple[list[dict[str, str]], str | None]:
-    """Poll Instagram Conversations API (`platform=instagram`) and return `(messages, error_msg)`."""
+) -> tuple[list[dict[str, str]], int, str | None]:
+    """Poll Instagram Conversations API (`platform=instagram`) and return `(messages, threads_count, error_msg)`."""
     cutoff_utc = datetime.now(timezone.utc) - timedelta(minutes=max(1, int(since_minutes)))
     base_params = {
         "platform": "instagram",
         "fields": "id,updated_time,participants,messages.limit(10){id,created_time,from,message}",
         "limit": min(max(int(limit_conversations), 1), 25),
     }
-    threads: list[dict[str, Any]] = []
+    threads_by_id: dict[str, dict[str, Any]] = {}
     own_sender_ids: set[str] = {ig_user_id}
+    any_success = False
     last_error: str | None = None
 
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
-            candidates: list[tuple[str, str]] = [
-                (f"{GRAPH_API_BASE_URL}/{ig_user_id}/conversations", access_token),
-                (f"{GRAPH_API_BASE_URL}/me/conversations", access_token),
+            candidates: list[tuple[str, dict[str, Any]]] = [
+                (
+                    f"{GRAPH_API_BASE_URL}/{ig_user_id}/conversations",
+                    {**base_params, "access_token": access_token},
+                ),
+                (
+                    f"{GRAPH_API_BASE_URL}/me/conversations",
+                    {**base_params, "access_token": access_token},
+                ),
             ]
-            resp: httpx.Response | None = None
-            for endpoint, tok in candidates:
-                resp = await client.get(endpoint, params={**base_params, "access_token": tok})
-                if not resp.is_error:
-                    break
-                last_error = _extract_meta_error(resp)
-
-            if resp is not None and resp.is_error:
-                page_creds = await _resolve_linked_page_credentials(client, ig_user_id, access_token)
-                if page_creds is not None:
-                    page_id, page_token = page_creds
-                    own_sender_ids.add(page_id)
-                    resp = await client.get(
+            page_creds = await _resolve_linked_page_credentials(client, ig_user_id, access_token)
+            if page_creds is not None:
+                page_id, page_token = page_creds
+                own_sender_ids.add(page_id)
+                candidates.append(
+                    (
                         f"{GRAPH_API_BASE_URL}/{page_id}/conversations",
-                        params={**base_params, "access_token": page_token},
+                        {**base_params, "access_token": page_token},
                     )
-                    if resp.is_error:
-                        last_error = _extract_meta_error(resp)
+                )
+                candidates.append(
+                    (
+                        f"{GRAPH_API_BASE_URL}/{page_id}/conversations",
+                        {**base_params, "folder": "other", "access_token": page_token},
+                    )
+                )
 
-            if resp is None or resp.is_error:
+            for endpoint, req_params in candidates:
+                resp = await client.get(endpoint, params=req_params)
+                if resp.is_error:
+                    last_error = _extract_meta_error(resp)
+                    continue
+                any_success = True
+                raw_threads = resp.json().get("data") or []
+                if isinstance(raw_threads, list):
+                    for t in raw_threads:
+                        if isinstance(t, dict) and t.get("id"):
+                            threads_by_id.setdefault(str(t["id"]), t)
+                # Keep checking page endpoints if primary endpoint returned 0 threads
+                if threads_by_id and "folder" not in req_params:
+                    break
+
+            if not any_success:
                 logger.warning(
-                    "Polling Conversations IG no disponible (%s): %s",
-                    resp.status_code if resp is not None else "N/A",
+                    "Polling Conversations IG no disponible: %s",
                     last_error or "Error desconocido",
                 )
-                return [], last_error or "Error consultando Conversations API de Meta"
-
-            last_error = None
-            raw_threads = resp.json().get("data") or []
-            if isinstance(raw_threads, list):
-                threads = raw_threads
+                return [], 0, last_error or "Error consultando Conversations API de Meta"
     except Exception as exc:
         logger.warning("Error consultando Conversations API de IG: %s", exc)
-        return [], str(exc)
+        return [], 0, str(exc)
 
+    threads = list(threads_by_id.values())
     collected: list[dict[str, str]] = []
     for thread in threads:
-        if not isinstance(thread, dict):
-            continue
         participants_map: dict[str, str] = {}
         raw_parts = (thread.get("participants") or {}).get("data") or []
         for p in raw_parts:
@@ -976,8 +989,10 @@ async def fetch_instagram_dm_messages_with_status(
             text = str(msg.get("message", "") or "").strip()
             from_username = str(from_obj.get("username") or participants_map.get(from_id, "")).strip()
             created_raw = str(msg.get("created_time", "")).strip()
-            if not mid or not text or not from_id:
+            if not mid or not from_id:
                 continue
+            if not text:
+                text = "[Mensaje multimedia / sticker / respuesta a historia sin texto]"
 
             created_dt = _parse_meta_timestamp(created_raw) if created_raw else None
             if created_dt is not None and created_dt < cutoff_utc:
@@ -994,7 +1009,24 @@ async def fetch_instagram_dm_messages_with_status(
             )
 
     collected.sort(key=lambda item: item.get("created_time", ""))
-    return collected, None
+    return collected, len(threads), None
+
+
+async def fetch_instagram_dm_messages_with_status(
+    ig_user_id: str,
+    access_token: str,
+    *,
+    limit_conversations: int = 20,
+    since_minutes: int = 4320,
+) -> tuple[list[dict[str, str]], str | None]:
+    """Poll Instagram Conversations API (`platform=instagram`) and return `(messages, error_msg)`."""
+    messages, _, err = await fetch_instagram_dm_messages_detailed(
+        ig_user_id=ig_user_id,
+        access_token=access_token,
+        limit_conversations=limit_conversations,
+        since_minutes=since_minutes,
+    )
+    return messages, err
 
 
 async def fetch_recent_instagram_dm_messages(

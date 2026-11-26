@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
 MAX_INSTAGRAM_HASHTAGS = 5
 TRENDS_CACHE_TTL_SECONDS = 6 * 3600
+MANDATORY_CAPTION_CLOSING = "Recuerda: tu comida, tu mejor medicina."
 
 _TRENDS_CACHE_LOCK = threading.Lock()
 _TRENDS_CACHE: dict[str, Any] = {
@@ -70,11 +71,19 @@ Reglas editoriales y estratégicas obligatorias:
    - Usa el resumen de tendencias actualizadas de redes sociales (Instagram Reels, TikTok, Shorts en salud/metabolismo/bienestar) para potenciar incluso los videos ya grabados por Manuel.
    - Redacta un `hook_title` (gancho de los primeros 3 segundos o texto de portada) y un `caption` con narrativa actual orientada a retención, guardados y compartidos orgánicos (además de seguidores nuevos).
    - Explica brevemente en `trend_alignment` cómo esta pauta aprovecha una tendencia, formato o ángulo viral replicable actual (ej. texto de gancho, formato de audio/edición sugerido en portada/descripción, o enfoque de debate saludable).
-4. Tono, ética y límite ESTRICTO de hashtags de @nelhealthcoach:
+4. Tono, ética y reglas OBLIGATORIAS del caption y hashtags de @nelhealthcoach:
    - Cercano, empático, educativo, basado en salud integrativa, metabolismo y hábitos.
    - NUNCA hagas promesas médicas milagrosas ni garantías de cura.
-   - Redacta un `caption` con gancho claro y llamado a la acción (CTA), SIN hashtags incrustados dentro del caption.
-   - En `hashtags`, entrega **EXACTAMENTE 5 hashtags** relevantes (o como máximo absoluto **5 hashtags**). Instagram actualmente solo permite un máximo de 5 hashtags por publicación: **NUNCA pongas 6 ni más**.
+   - Redacta el `caption` (cuando no sea Historia) cumpliendo estrictamente TODAS estas características:
+     * **Gancho SEO (primeros 125 caracteres)**: Arranca con una pregunta o afirmación directa usando palabras clave de salud metabólica (NO uses etiquetas comerciales como "keto" o "paleo").
+     * **Cero venta fría en el texto**: PROHIBIDO usar frases como "Agenda tu cita", "Reserva tu consulta" o enlaces directos dentro del caption (reducen el alcance).
+     * **Disparador de comentarios (DM)**: Pide comentar una palabra clave exacta (ej. "Comenta PLAN, METABOLISMO, REINICIO o DETOX y te envío la guía al privado").
+     * **Llamado a guardar y compartir**: Pide explícitamente que guarden el post o se lo envíen a alguien.
+     * **Extensión y estructura (3 a 4 párrafos cortos)**: No hagas captions largos; usa entre **3 y 4 párrafos cortos pero explicativos**, separados por línea en blanco.
+     * **Emojis moderados**: Usa algunos emojis relacionados sin abusar.
+     * **Cierre obligatorio exacto**: Termina SIEMPRE el caption con la frase exacta:
+       `Recuerda: tu comida, tu mejor medicina.`
+   - En `hashtags`, entrega **EXACTAMENTE 5 hashtags** relevantes (o como máximo absoluto **5 hashtags**, NUNCA 6 ni más, ni dentro del caption).
 5. Pauta en Meta Ads (solo Instagram):
    - Evalúa de forma inteligente si el contenido amerita inversión en Meta Ads (`promote_in_ads = true`) o debe ir orgánico (`false`).
    - El sistema utiliza automáticamente el público guardado `'mujeres'` y la tarjeta configurada en la cuenta publicitaria.
@@ -92,7 +101,8 @@ REVISION_SYSTEM_INSTRUCTION = """Eres el Director de Contenido y Estratega de "N
 Cuando Manuel pide un cambio sobre una propuesta:
 1. Si `force_apply` es True (o si Manuel está insistiendo claramente después de una sugerencia previa), DEBES obedecer exactamente lo que Manuel pide: pon `ai_assessment = "ACCEPTED"`, aplica sus cambios al pie de la letra en `proposal`, y confirma brevemente en `reasoning_message` (respetando siempre el límite de máximo 5 hashtags de Instagram, salvo que el texto de hashtags ya venga fijado en 5).
 2. Si `force_apply` es False:
-   - Razona críticamente el cambio pedido por Manuel evaluando: la regla estricta de contenido (videos grabados por Manuel a cámara = `MAIN` Lun/Mié/Vie; `PRO_TIP` Mar/Jue/Sáb = solo carrusel automático de textos/imágenes o imagen vertical de texto), horario óptimo según el tema, retención del copy/CTA, cumplimiento ético en salud, tendencias actuales de crecimiento orgánico, límite estricto de máximo 5 hashtags en Instagram y retorno en Meta Ads.
+   - Razona críticamente el cambio pedido por Manuel evaluando: la regla estricta de contenido (videos grabados por Manuel a cámara = `MAIN` Lun/Mié/Vie; `PRO_TIP` Mar/Jue/Sáb = solo carrusel automático de textos/imágenes o imagen vertical de texto), horario óptimo según el tema, cumplimiento ético en salud, tendencias actuales de crecimiento orgánico, límite estricto de máximo 5 hashtags en Instagram y retorno en Meta Ads.
+   - Para cualquier `caption` de feed (no Historias), mantén siempre: gancho SEO en los primeros 125 caracteres (sin keto/paleo), cero venta fría ni enlaces en el texto, disparador de comentario con palabra clave, llamado a guardar y compartir, **3 a 4 párrafos cortos pero explicativos** separados por línea en blanco, emojis moderados y el cierre exacto `Recuerda: tu comida, tu mejor medicina.` al final.
    - Si el cambio de Manuel es acertado o mejora la propuesta -> `ai_assessment = "ACCEPTED"`, aplícalo en `proposal` y explica en `reasoning_message` por qué es una buena decisión.
    - Si ves que lo que pide Manuel puede perjudicar el rendimiento (ej. mal horario para el tema, romper la cadencia semanal, perder el CTA, promocionar algo que funciona mejor orgánico, etc.) -> `ai_assessment = "ALTERNATIVE_SUGGESTED"`, explica claramente en `reasoning_message` por qué sugieres otra alternativa mejor, y entrega esa alternativa mejorada en `proposal` (para que Manuel decida si acepta tu alternativa o insiste en su cambio).
 """
@@ -105,7 +115,7 @@ Reglas obligatorias:
 2. En `viral_formats_to_replicate`, propón formatos de video viral concretos que Manuel pueda replicar fácilmente frente a cámara o con B-roll simple (estructura segundo a segundo, gancho visual/texto en pantalla, ritmo/audio).
 3. En `new_post_ideas`, propón de 4 a 5 ideas de pautas con alto potencial orgánico por sí mismas (para provocar guardados, compartidos y nuevos seguidores):
    - Respeta la distinción `MAIN` (video con Manuel a cámara para Lun/Mié/Vie) y `PRO_TIP` (carrusel texto/imagen o story sin presentador para Mar/Jue/Sáb).
-   - Incluye un gancho de 3 segundos irresistible (`viral_hook`), explicación de por qué funciona según las tendencias actuales (`why_it_trends`), guía práctica de grabación/producción (`recording_guide`), borrador de `suggested_caption` con CTA orgánico, y **exactamente 5 hashtags (máximo estricto 5)** sin promesas médicas milagrosas.
+   - Incluye un gancho de 3 segundos irresistible (`viral_hook`), explicación de por qué funciona según las tendencias actuales (`why_it_trends`), guía práctica de grabación/producción (`recording_guide`), borrador de `suggested_caption` (con gancho SEO en los primeros 125 caracteres sin keto/paleo, cero venta fría ni enlaces, disparador de comentarios por palabra clave, llamado a guardar y compartir, **3 a 4 párrafos cortos pero explicativos** separados por línea en blanco, pocos emojis relacionados y cierre exacto `Recuerda: tu comida, tu mejor medicina.`), y **exactamente 5 hashtags (máximo estricto 5)** sin promesas médicas milagrosas.
 """
 
 
@@ -342,12 +352,24 @@ def normalize_hashtags(
     return " ".join(result)
 
 
+_COLD_SELL_RE = re.compile(
+    r"(?i)\b(?:agenda|reserva)\s+(?:tu|una)\s+(?:cita|consulta|sesi[oó]n)[^.\n!?]*[.!?]?\s*"
+)
+_COLD_URL_RE = re.compile(r"https?://\S+|www\.\S+", re.IGNORECASE)
+_CLOSING_TAIL_RE = re.compile(
+    r"(?i)(?:\n+\s*)*recuerda\s*:\s*tu\s+comida\s*,?\s*tu\s+mejor\s+medicina\.?\s*$"
+)
+
+
 def _enforce_caption_and_hashtags(
     caption: str,
     hashtags: str,
     max_count: int = MAX_INSTAGRAM_HASHTAGS,
+    *,
+    enforce_closing: bool = True,
+    strip_cold_links: bool = True,
 ) -> tuple[str, str]:
-    """Strip trailing hashtag blocks from caption and cap total unique hashtags at `max_count`."""
+    """Normalize feed caption rules, strip trailing hashtags, and cap unique hashtags at `max_count`."""
     lines = caption.strip().splitlines()
     extracted_trailing: list[str] = []
 
@@ -364,6 +386,21 @@ def _enforce_caption_and_hashtags(
         break
 
     clean_caption = "\n".join(lines).strip()
+    if strip_cold_links and clean_caption:
+        clean_caption = _COLD_URL_RE.sub("", clean_caption)
+        clean_caption = _COLD_SELL_RE.sub("", clean_caption)
+        clean_caption = "\n".join(ln.rstrip() for ln in clean_caption.splitlines())
+        clean_caption = re.sub(r"[ \t]{2,}", " ", clean_caption)
+        clean_caption = re.sub(r"\n{3,}", "\n\n", clean_caption).strip()
+
+    if enforce_closing:
+        body_without_closing = _CLOSING_TAIL_RE.sub("", clean_caption).strip()
+        clean_caption = (
+            f"{body_without_closing}\n\n{MANDATORY_CAPTION_CLOSING}"
+            if body_without_closing
+            else MANDATORY_CAPTION_CLOSING
+        )
+
     inline_tags = re.findall(r"#[\wáéíóúüñÁÉÍÓÚÜÑ]+", clean_caption)
     inline_seen = {t.lower() for t in inline_tags}
     remaining_budget = max(0, max_count - len(inline_seen))
@@ -525,6 +562,7 @@ def _normalize_proposal(
             raw_tiktok_caption or clean_caption,
             clean_hashtags,
             max_count=MAX_INSTAGRAM_HASHTAGS,
+            enforce_closing=False,
         )
 
     return PostProposal(
@@ -1108,7 +1146,7 @@ def generate_video_script(
         "- Tono cercano, empático, educativo en salud integrativa/metabolismo, sin promesas médicas milagrosas.\n"
         "- Gancho verbal de 0 a 3 segundos, desarrollo claro (3-45s) y cierre con CTA orgánico para guardados/compartidos (45-60s).\n"
         "- En `recording_notes`, da indicaciones prácticas de cámara/ritmo/B-roll, SIN sugerir textos de portada.\n"
-        "- Entrega caption (sin hashtags) y exactamente 5 hashtags (máximo estricto 5)."
+        "- Entrega `caption` (gancho SEO en los primeros 125 caracteres sin keto/paleo, cero venta fría ni enlaces, disparador de comentarios por palabra clave, llamado a guardar/compartir, 3 a 4 párrafos cortos pero explicativos separados por línea en blanco, pocos emojis relacionados y cierre exacto `Recuerda: tu comida, tu mejor medicina.`) y exactamente 5 hashtags (máximo estricto 5)."
     )
 
     try:

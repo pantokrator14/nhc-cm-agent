@@ -611,6 +611,65 @@ class TestDriveWeeksAndGuidelinesLogic(unittest.TestCase):
             )
             self.assertEqual(res2.moved_names, [])
 
+    def test_append_and_update_sort_entries_chronologically_by_date_and_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sa_path = _write_sa_json(Path(tmpdir))
+            mock_docs = MagicMock()
+            # Existing doc: 9. El sol (27/11 08:00) at idx 25..80, 10. Meditar (30/11 20:00) at idx 80..140
+            mock_docs.documents().get().execute.return_value = {
+                "body": {
+                    "content": [
+                        {"startIndex": 1, "endIndex": 25, "paragraph": {"elements": [{"textRun": {"content": "=== PAUTAS DEL MES ===\n"}}]}},
+                        {"startIndex": 25, "endIndex": 35, "paragraph": {"elements": [{"textRun": {"content": "9. El sol\n"}}]}},
+                        {"startIndex": 35, "endIndex": 55, "paragraph": {"elements": [{"textRun": {"content": "Fecha: Viernes 27/11/2026\n"}}]}},
+                        {"startIndex": 55, "endIndex": 80, "paragraph": {"elements": [{"textRun": {"content": "Horario: 08:00 hrs\n"}}]}},
+                        {"startIndex": 80, "endIndex": 92, "paragraph": {"elements": [{"textRun": {"content": "10. Meditar\n"}}]}},
+                        {"startIndex": 92, "endIndex": 115, "paragraph": {"elements": [{"textRun": {"content": "Fecha: Lunes 30/11/2026\n"}}]}},
+                        {"startIndex": 115, "endIndex": 140, "paragraph": {"elements": [{"textRun": {"content": "Horario: 20:00 hrs\n"}}]}},
+                    ]
+                }
+            }
+            mock_docs.documents().batchUpdate().execute.return_value = {}
+
+            # 1. Appending Historia 1 for 26/11 06:00 MUST insert at index 25 (before 9. El sol on 27/11)
+            story_lines = drive_service.format_guideline_entry_lines(
+                doc_header="Historia 1: Orinar y Salud",
+                scheduled_dt=datetime(2026, 11, 26, 6, 0, tzinfo=timezone.utc),
+                promote_in_ads=False,
+                ads_recommendation="No aplica",
+                hook_title="Cómo orinas",
+                caption="",
+                hashtags="",
+                is_story=True,
+            )
+            self.assertIn("Pauta en Meta Ads: No aplica (Historia de 24h en Instagram).", story_lines)
+            with patch.object(drive_service, "_get_docs_client", return_value=mock_docs):
+                drive_service.append_entry_to_monthly_doc("doc_pautas", story_lines, credentials_path=sa_path)
+
+            append_reqs = mock_docs.documents().batchUpdate.call_args.kwargs["body"]["requests"]
+            self.assertEqual(append_reqs[0]["insertText"]["location"]["index"], 25)
+
+            # 2. Updating 9. El sol from 27/11 to 29/11? Still before 30/11 -> index 25.
+            # Updating 9. El sol from 27/11 to 01/12 (after 30/11) -> deletes [25, 80) (len 55),
+            # then inserts at end (raw 139 - 55 = 84)
+            moved_lines = drive_service.format_guideline_entry_lines(
+                doc_header="9. El sol",
+                scheduled_dt=datetime(2026, 12, 1, 8, 0, tzinfo=timezone.utc),
+                promote_in_ads=False,
+                ads_recommendation="Orgánico.",
+                hook_title="El sol",
+                caption="Luz natural",
+                hashtags="#sol",
+            )
+            with patch.object(drive_service, "_get_docs_client", return_value=mock_docs):
+                drive_service.update_entry_in_monthly_doc(
+                    "doc_pautas", "9. El sol", moved_lines, credentials_path=sa_path
+                )
+
+            upd_reqs = mock_docs.documents().batchUpdate.call_args.kwargs["body"]["requests"]
+            self.assertEqual(upd_reqs[0]["deleteContentRange"]["range"], {"startIndex": 25, "endIndex": 80})
+            self.assertEqual(upd_reqs[1]["insertText"]["location"]["index"], 84)
+
 
 if __name__ == "__main__":
     unittest.main()

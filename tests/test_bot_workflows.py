@@ -348,13 +348,107 @@ class TestMetricsArgsAndDmPolling(unittest.IsolatedAsyncioTestCase):
             context = SimpleNamespace(args=[])
 
             with patch(
-                "telegram_bot.fetch_instagram_dm_messages_with_status",
-                AsyncMock(return_value=([], "Requires instagram_manage_messages (code=200)")),
+                "telegram_bot.fetch_instagram_dm_messages_detailed",
+                AsyncMock(return_value=([], 0, "Requires instagram_manage_messages (code=200)")),
             ):
                 await bot_ctrl.cmd_mensajes(update, context)
 
             final_reply = reply_msg.reply_text.call_args_list[-1].args[0]
             self.assertIn("instagram_manage_messages", final_reply)
+
+    async def test_fetch_dm_messages_resolves_linked_page_even_when_ig_endpoint_returns_empty(self) -> None:
+        from meta_publisher import fetch_instagram_dm_messages_detailed
+
+        def _fake_resp(status: int, payload: dict) -> MagicMock:
+            resp = MagicMock()
+            resp.status_code = status
+            resp.is_error = status >= 400
+            resp.json.return_value = payload
+            resp.text = json.dumps(payload)
+            return resp
+
+        async def _mock_get(url: str, params: dict | None = None):
+            if "/ig-123/conversations" in url or "/me/conversations" in url:
+                return _fake_resp(200, {"data": []})
+            if "/me/accounts" in url:
+                return _fake_resp(
+                    200,
+                    {
+                        "data": [
+                            {
+                                "id": "page-999",
+                                "name": "Nel Health Coach",
+                                "access_token": "page-tok",
+                                "instagram_business_account": {"id": "ig-123"},
+                            }
+                        ]
+                    },
+                )
+            if "/page-999/conversations" in url:
+                return _fake_resp(
+                    200,
+                    {
+                        "data": [
+                            {
+                                "id": "conv_req",
+                                "participants": {"data": [{"id": "user-9", "username": "laura"}]},
+                                "messages": {
+                                    "data": [
+                                        {
+                                            "id": "mid_nontext",
+                                            "created_time": "2026-11-25T14:00:00+0000",
+                                            "from": {"id": "user-9", "username": "laura"},
+                                            "message": "",
+                                        }
+                                    ]
+                                },
+                            }
+                        ]
+                    },
+                )
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(side_effect=_mock_get)
+        mock_client_cm = MagicMock()
+        mock_client_cm.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client_cm.__aexit__ = AsyncMock(return_value=False)
+
+        with patch("meta_publisher.httpx.AsyncClient", return_value=mock_client_cm):
+            msgs, threads_count, err = await fetch_instagram_dm_messages_detailed(
+                ig_user_id="ig-123",
+                access_token="user-tok",
+                since_minutes=4320,
+            )
+
+        self.assertIsNone(err)
+        self.assertEqual(threads_count, 1)
+        self.assertEqual(len(msgs), 1)
+        self.assertEqual(msgs[0]["sender_username"], "laura")
+        self.assertIn("sin texto", msgs[0]["message_text"])
+
+    async def test_manual_drive_check_notifies_when_no_new_files(self) -> None:
+        import asyncio
+        import main as main_mod
+        from drive_service import MonthFolderResolution
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            bot_ctrl, mock_tg_bot = _make_bot(tmp)
+            scan_lock = asyncio.Lock()
+
+            with patch("main.ensure_current_month_folder", return_value=MonthFolderResolution("m1", False)), patch(
+                "main.get_monthly_doc_metadata", return_value={"id": "doc1"}
+            ), patch("main.ensure_statistics_folder"), patch(
+                "main.get_monthly_guidelines", return_value="PAUTAS"
+            ), patch("main.list_pending_files", return_value=[]):
+                await main_mod.run_monthly_drive_review(
+                    bot_ctrl.settings, bot_ctrl, scan_lock, notify_always=True
+                )
+
+            sent_text = mock_tg_bot.send_message.call_args_list[0].kwargs["text"]
+            self.assertIn("Escaneo completado", sent_text)
+            self.assertIn("no hay archivos nuevos pendientes", sent_text)
 
     async def test_meta_token_health_clears_stale_state_and_uses_new_env_token(self) -> None:
         from drive_service import get_effective_meta_token, load_state, save_meta_auth_state

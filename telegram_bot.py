@@ -106,6 +106,7 @@ from meta_ads_service import (
 from meta_publisher import (
     MetaTokenStatus,
     check_and_refresh_meta_token,
+    fetch_instagram_dm_messages_detailed,
     fetch_instagram_dm_messages_with_status,
     fetch_instagram_media_context,
     fetch_instagram_user_profile,
@@ -875,7 +876,7 @@ class NelHealthCoachBot:
             post_category=entry.post_category,
             short_title=entry.short_title or entry.header,
             hook_title=entry.hook_title or entry.short_title,
-            caption=entry.caption or entry.hook_title or entry.short_title,
+            caption=entry.caption if is_story else (entry.caption or entry.hook_title or entry.short_title),
             hashtags=clean_hashtags,
             trend_alignment="",
             media_type=media_type,
@@ -890,7 +891,7 @@ class NelHealthCoachBot:
             target_link=entry.target_link,
             public_reply_text="",
             publish_to_tiktok=is_video and not is_story,
-            tiktok_caption=entry.caption or entry.hook_title or entry.short_title,
+            tiktok_caption="" if is_story else (entry.caption or entry.hook_title or entry.short_title),
         )
         proposal_id = uuid.uuid4().hex[:10]
         return ProposalSession(
@@ -1402,12 +1403,13 @@ class NelHealthCoachBot:
             )
 
         if doc_meta:
-            ads_detail = p.ads_recommendation
+            ads_detail = p.ads_recommendation.strip()
             if p.promote_in_ads and p.ads_daily_budget_usd > 0:
-                ads_detail = (
-                    f"${p.ads_daily_budget_usd:.2f}/día × {p.ads_duration_days} días — "
-                    f"{p.ads_recommendation}"
-                )
+                if "$" not in ads_detail and "/día" not in ads_detail:
+                    ads_detail = (
+                        f"${p.ads_daily_budget_usd:.2f}/día × {p.ads_duration_days} días — "
+                        f"{ads_detail}"
+                    )
             entry_lines = format_guideline_entry_lines(
                 doc_header=doc_header,
                 scheduled_dt=scheduled_dt,
@@ -2777,7 +2779,10 @@ class NelHealthCoachBot:
             return
         await update.effective_message.reply_text("🔍 Escaneando carpeta del mes actual en Drive...")
         if self.scan_callback is not None:
-            await self.scan_callback()
+            try:
+                await self.scan_callback(manual=True)
+            except TypeError:
+                await self.scan_callback()
         else:
             logger.warning("cmd_check invocado sin scan_callback configurado.")
 
@@ -2960,7 +2965,7 @@ class NelHealthCoachBot:
             "📩 Revisando mensajes directos y solicitudes de mensajes en Instagram (últimos 30 días)..."
         )
         try:
-            forwarded, total_found, error_msg = await self._poll_instagram_dms_detailed(
+            forwarded, total_found, threads_count, error_msg = await self._poll_instagram_dms_detailed(
                 limit_conversations=25,
                 since_minutes=43200,
             )
@@ -2986,7 +2991,8 @@ class NelHealthCoachBot:
         )
         if forwarded > 0:
             await update.effective_message.reply_text(
-                f"✅ Se detectaron y enviaron <b>{forwarded}</b> mensaje(s)/solicitud(es) pendiente(s) con sugerencias de respuesta.",
+                f"✅ Se detectaron y enviaron <b>{forwarded}</b> mensaje(s)/solicitud(es) pendiente(s) con sugerencias de respuesta "
+                f"(hilos leídos desde Meta: {threads_count}).",
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -2996,9 +3002,18 @@ class NelHealthCoachBot:
             if pending_in_memory > 0
             else ""
         )
+        diag_note = (
+            "\n\n⚠️ <b>Meta devolvió 0 conversaciones por API.</b> Si ves solicitudes abiertas en la app de Instagram, "
+            "casi siempre significa una de estas 3 cosas:\n"
+            "• Tu App en <code>developers.facebook.com</code> sigue en <b>Modo Desarrollo</b> o con <b>Acceso Estándar</b> en <code>instagram_manage_messages</code> (Meta oculta mensajes de cuentas públicas que no sean Testers hasta aprobar <i>App Review / Acceso Avanzado</i>).\n"
+            "• La solicitud está en <i>Solicitudes ocultas/spam</i> o lleva >30 días sin actividad (Meta no la expone por API).\n"
+            "• En Instagram móvil: <i>Herramientas conectadas → Permitir acceso a los mensajes</i>."
+            if threads_count == 0
+            else "\n\n<i>Nota: Meta solo expone solicitudes activas de los últimos 30 días y requiere tener activado 'Permitir acceso a los mensajes' en Instagram.</i>"
+        )
         await update.effective_message.reply_text(
-            f"✅ Revisión completada: no hay mensajes o solicitudes nuevas sin procesar (hilos sin responder detectados por API: {total_found}).{extra}\n\n"
-            "<i>Nota: Meta solo expone solicitudes activas de los últimos 30 días y requiere tener activado 'Permitir acceso a los mensajes' en Instagram.</i>",
+            f"✅ Revisión completada: no hay mensajes o solicitudes nuevas sin procesar "
+            f"(hilos devueltos por Meta: <b>{threads_count}</b> | sin responder detectados: <b>{total_found}</b>).{extra}{diag_note}",
             parse_mode=ParseMode.HTML,
         )
 
@@ -3370,17 +3385,17 @@ class NelHealthCoachBot:
         *,
         limit_conversations: int = 20,
         since_minutes: int = 4320,
-    ) -> tuple[int, int, str | None]:
-        """Poll Instagram Conversations API and return `(forwarded, total_found, error_msg)`."""
+    ) -> tuple[int, int, int, str | None]:
+        """Poll Instagram Conversations API and return `(forwarded, total_found, threads_count, error_msg)`."""
         meta_token = await asyncio.to_thread(self._get_effective_meta_token)
-        recent_dms, error_msg = await fetch_instagram_dm_messages_with_status(
+        recent_dms, threads_count, error_msg = await fetch_instagram_dm_messages_detailed(
             ig_user_id=self.settings.ig_user_id,
             access_token=meta_token,
             limit_conversations=limit_conversations,
             since_minutes=since_minutes,
         )
         if error_msg:
-            return 0, 0, error_msg
+            return 0, 0, threads_count, error_msg
 
         forwarded = 0
         for dm in recent_dms:
@@ -3405,11 +3420,11 @@ class NelHealthCoachBot:
                 media_id="",
             )
             forwarded += 1
-        return forwarded, len(recent_dms), None
+        return forwarded, len(recent_dms), threads_count, None
 
     async def poll_instagram_dms(self) -> int:
         """Poll Instagram Conversations API to catch DMs and Message Requests not delivered by webhook."""
-        forwarded, _, _ = await self._poll_instagram_dms_detailed()
+        forwarded, _, _, _ = await self._poll_instagram_dms_detailed()
         return forwarded
 
     async def check_meta_token_health(self, *, notify_always: bool = False) -> MetaTokenStatus:

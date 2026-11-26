@@ -157,6 +157,31 @@ class TestStoryTelegramDisplayAndBuild(unittest.TestCase):
             self.assertFalse(any(l.startswith("Hashtags:") for l in story_lines))
             self.assertIn("Nota / Comentario: Sticker de encuesta en pantalla", story_lines)
 
+    def test_enforce_caption_and_hashtags_applies_closing_strips_cold_links_and_caps_5(self) -> None:
+        raw_caption = (
+            "¿Por qué tu metabolismo se siente lento aunque comas poco?\n\n"
+            "Agenda tu cita en https://nelhealthcoach.com para empezar.\n\n"
+            "Comenta METABOLISMO y guárdalo para compartirlo.\n"
+            "#uno #dos #tres #cuatro #cinco #seis"
+        )
+        clean_cap, clean_tags = gemini_agent._enforce_caption_and_hashtags(
+            raw_caption,
+            "#salud #extra",
+            max_count=5,
+        )
+        self.assertNotIn("https://", clean_cap)
+        self.assertNotIn("Agenda tu cita", clean_cap)
+        self.assertTrue(clean_cap.endswith(gemini_agent.MANDATORY_CAPTION_CLOSING))
+        self.assertEqual(len(clean_tags.split()), 5)
+
+        # Idempotent: does not duplicate closing when already present
+        clean_cap2, _ = gemini_agent._enforce_caption_and_hashtags(
+            clean_cap,
+            clean_tags,
+            max_count=5,
+        )
+        self.assertEqual(clean_cap2.count(gemini_agent.MANDATORY_CAPTION_CLOSING), 1)
+
 
 class TestGoogleOAuthSetupHelper(unittest.TestCase):
     def test_load_client_credentials_and_extract_code(self) -> None:

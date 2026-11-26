@@ -73,10 +73,16 @@ async def run_monthly_drive_review(
     settings: Settings,
     bot_controller: NelHealthCoachBot,
     scan_lock: asyncio.Lock,
+    *,
+    notify_always: bool = False,
 ) -> None:
     """Resolve current YYYY/MM Drive folder, read monthly guidelines, and propose new media."""
     if scan_lock.locked():
         logger.info("Escaneo de Drive ya en ejecución; se omite ciclo superpuesto.")
+        if notify_always:
+            await bot_controller.notify_info(
+                "⏳ Ya hay un escaneo de Drive en ejecución; espera unos segundos y vuelve a intentar."
+            )
         return
 
     async with scan_lock:
@@ -246,6 +252,12 @@ async def run_monthly_drive_review(
 
         if not pending_files:
             logger.info("No hay archivos nuevos por procesar en %s/%s.", year_str, month_str)
+            if notify_always:
+                await bot_controller.notify_info(
+                    f"✅ Escaneo completado (<code>{year_str}/{month_str}</code>): no hay archivos nuevos pendientes en Drive "
+                    "(todos los multimedia ya están publicados, programados o registrados en Pautas).\n\n"
+                    "Usa /pautas para ver las pautas pendientes de publicar o /status para ver la cola."
+                )
             return
 
         candidate_files = [
@@ -253,6 +265,16 @@ async def run_monthly_drive_review(
         ]
         if not candidate_files:
             logger.info("No hay archivos nuevos por evaluar en %s/%s.", year_str, month_str)
+            if notify_always:
+                preview_names = ", ".join(
+                    html.escape(str(f.get("name", f.get("id", "")))) for f in pending_files[:6]
+                )
+                more = f" (+{len(pending_files) - 6} más)" if len(pending_files) > 6 else ""
+                await bot_controller.notify_info(
+                    f"✅ Escaneo completado (<code>{year_str}/{month_str}</code>): hay <b>{len(pending_files)}</b> archivo(s) "
+                    f"que ya tienen propuesta enviada esperando tu aprobación en Telegram ({preview_names}{more}).\n\n"
+                    "Usa /status para ver el resumen o /pautas para revisar pautas existentes."
+                )
             return
 
         if guidelines_text is None:
@@ -294,12 +316,14 @@ async def run_monthly_drive_review(
             return
 
         unlisted_files: list[dict] = []
+        matched_count = 0
         for file_meta in candidate_files:
             file_id = file_meta["id"]
             file_name = file_meta.get("name", file_id)
             match = classification.get(file_id)
 
             if match and match.already_in_guidelines:
+                matched_count += 1
                 logger.info(
                     "Omitiendo '%s': ya aparece en el documento de pautas (%s).",
                     file_name,
@@ -324,6 +348,12 @@ async def run_monthly_drive_review(
                 year_str,
                 month_str,
             )
+            if notify_always:
+                await bot_controller.notify_info(
+                    f"✅ Escaneo completado (<code>{year_str}/{month_str}</code>): "
+                    f"los {matched_count} archivo(s) detectado(s) ya figuraban en el documento <b>Pautas</b>.\n\n"
+                    "Usa /pautas para listarlos, editarlos o programarlos."
+                )
             return
 
         await bot_controller.propose_pending_files(
@@ -331,6 +361,11 @@ async def run_monthly_drive_review(
             pending_files=unlisted_files,
             guidelines_text=guidelines_text,
         )
+        if notify_always:
+            await bot_controller.notify_info(
+                f"✅ Escaneo completado (<code>{year_str}/{month_str}</code>): "
+                f"se enviaron <b>{len(unlisted_files)}</b> propuesta(s) nueva(s)."
+            )
 
 
 async def run_agent(settings: Settings) -> None:
@@ -344,11 +379,18 @@ async def run_agent(settings: Settings) -> None:
         poll_interval_minutes=DRIVE_POLL_INTERVAL_MINUTES,
     )
 
-    async def scheduled_review() -> None:
+    async def scheduled_review(*, manual: bool = False) -> None:
         try:
-            await run_monthly_drive_review(settings, bot_controller, scan_lock)
+            await run_monthly_drive_review(
+                settings,
+                bot_controller,
+                scan_lock,
+                notify_always=manual,
+            )
         except Exception as exc:
             logger.exception("Error inesperado en ciclo programado de Drive: %s", exc)
+            if manual:
+                await bot_controller.notify_error(f"Error al escanear Drive: {exc}")
 
     bot_controller.scan_callback = scheduled_review
 
