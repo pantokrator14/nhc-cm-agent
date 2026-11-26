@@ -21,6 +21,8 @@ DEFAULT_META_SAVED_AUDIENCE_NAME = "mujeres"
 DEFAULT_TIKTOK_PUBLISH_MODE = "DIRECT"
 DEFAULT_TIKTOK_PRIVACY_LEVEL = "PUBLIC_TO_EVERYONE"
 DEFAULT_TIMEZONE = "America/Caracas"
+DEFAULT_WEBSITE_URL = "https://nelhealthcoach.com"
+DEFAULT_RESOURCES_FOLDER_NAME = "Guías PDF y recursos"
 
 
 def resolve_timezone(tz_name: str = DEFAULT_TIMEZONE) -> tzinfo:
@@ -53,6 +55,8 @@ class Settings:
 
     meta_access_token: str
     ig_user_id: str
+    drive_resources_folder_id: str = ""
+    drive_resources_folder_name: str = DEFAULT_RESOURCES_FOLDER_NAME
     google_drive_impersonate_email: str = ""
     google_oauth_credentials: Path | None = None
     telegram_extra_admin_chat_ids: tuple[int, ...] = ()
@@ -73,6 +77,7 @@ class Settings:
     webhook_verify_token: str = DEFAULT_WEBHOOK_VERIFY_TOKEN
     webhook_port: int = DEFAULT_WEBHOOK_PORT
     timezone_name: str = DEFAULT_TIMEZONE
+    website_url: str = DEFAULT_WEBSITE_URL
 
     base_dir: Path = BASE_DIR
     state_file_path: Path = DEFAULT_STATE_PATH
@@ -136,6 +141,11 @@ def load_settings(env_path: str | Path | None = None) -> Settings:
     google_drive_impersonate_email = os.getenv("GOOGLE_DRIVE_IMPERSONATE_EMAIL", "").strip()
     google_oauth_raw = os.getenv("GOOGLE_OAUTH_CREDENTIALS", "").strip()
     drive_root_folder_id = _require_env("DRIVE_ROOT_FOLDER_ID", missing)
+    drive_resources_folder_id = os.getenv("DRIVE_RESOURCES_FOLDER_ID", "").strip()
+    drive_resources_folder_name = (
+        os.getenv("DRIVE_RESOURCES_FOLDER_NAME", DEFAULT_RESOURCES_FOLDER_NAME).strip()
+        or DEFAULT_RESOURCES_FOLDER_NAME
+    )
 
     telegram_bot_token = _require_env("TELEGRAM_BOT_TOKEN", missing)
     telegram_chat_raw = _require_env("TELEGRAM_ADMIN_CHAT_ID", missing)
@@ -184,6 +194,10 @@ def load_settings(env_path: str | Path | None = None) -> Settings:
         or DEFAULT_TIMEZONE
     )
     resolve_timezone(timezone_name)
+    website_url = (
+        os.getenv("WEBSITE_URL", DEFAULT_WEBSITE_URL).strip()
+        or DEFAULT_WEBSITE_URL
+    )
 
     if missing:
         raise ConfigurationError(
@@ -241,6 +255,8 @@ def load_settings(env_path: str | Path | None = None) -> Settings:
         gemini_model=gemini_model,
         google_application_credentials=credentials_path,
         drive_root_folder_id=drive_root_folder_id,
+        drive_resources_folder_id=drive_resources_folder_id,
+        drive_resources_folder_name=drive_resources_folder_name,
         google_drive_impersonate_email=google_drive_impersonate_email,
         google_oauth_credentials=google_oauth_credentials,
         telegram_bot_token=telegram_bot_token,
@@ -263,6 +279,7 @@ def load_settings(env_path: str | Path | None = None) -> Settings:
         webhook_verify_token=webhook_verify_token,
         webhook_port=webhook_port,
         timezone_name=timezone_name,
+        website_url=website_url,
         base_dir=BASE_DIR,
         state_file_path=DEFAULT_STATE_PATH,
     )

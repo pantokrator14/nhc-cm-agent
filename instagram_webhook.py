@@ -36,6 +36,55 @@ def _keyword_matches(keyword: str, comment_text: str) -> bool:
     return normalized_keyword in normalized_text
 
 
+def _render_dm_message(
+    dm_message: str,
+    keyword: str,
+    target_link: str,
+    username: str,
+    website_url: str = "",
+) -> str:
+    """Build the final private DM text from custom `dm_message` with legacy `target_link` fallback."""
+    clean_dm = dm_message.strip()
+    clean_link = target_link.strip()
+    clean_site = website_url.strip()
+    mention = f"@{username.lstrip('@')}" if username.strip() else ""
+
+    if clean_dm:
+        rendered = clean_dm
+        if "{username}" in rendered:
+            rendered = rendered.replace("{username}", mention)
+            rendered = re.sub(r"[ \t]+([!?,.:;])", r"\1", rendered)
+            rendered = re.sub(r"[ \t]{2,}", " ", rendered).strip()
+        if clean_link and clean_link not in rendered:
+            rendered = f"{rendered}\n\n{clean_link}"
+        if clean_site:
+            domain_hint = re.sub(r"^https?://(?:www\.)?", "", clean_site.lower()).split("/", 1)[0].strip()
+            if clean_site.lower() not in rendered.lower() and (not domain_hint or domain_hint not in rendered.lower()):
+                rendered = (
+                    f"{rendered}\n\n"
+                    "✨ Te invito a visitar nuestra página web para descubrir cómo podemos acompañarte:\n"
+                    f"{clean_site}"
+                )
+        return rendered
+
+    effective_link = clean_link or clean_site
+    if effective_link:
+        greeting = f"¡Hola {mention}! 💚" if mention else "¡Hola! 💚"
+        if clean_link and clean_site and clean_link != clean_site:
+            return (
+                f"{greeting} Gracias por comentar {keyword}.\n\n"
+                f"Aquí tienes el enlace que solicitaste:\n{clean_link}\n\n"
+                "✨ También te invito a visitar nuestra página web:\n"
+                f"{clean_site}"
+            )
+        return (
+            f"{greeting} Gracias por comentar {keyword}.\n\n"
+            "✨ Te invito a visitar nuestra página web para conocer más:\n"
+            f"{effective_link}"
+        )
+    return ""
+
+
 async def _send_private_dm(
     client: httpx.AsyncClient,
     ig_user_id: str,
@@ -137,6 +186,7 @@ async def _process_comment_event(
 
         keyword = str(media_record.get("keyword", "")).strip().upper()
         target_link = str(media_record.get("target_link", "")).strip()
+        dm_message = str(media_record.get("dm_message", "")).strip()
         public_reply_text = str(media_record.get("public_reply_text", "")).strip()
 
         logger.info(
@@ -149,14 +199,16 @@ async def _process_comment_event(
 
         dm_sent = False
         reply_sent = False
+        dm_text = _render_dm_message(
+            dm_message=dm_message,
+            keyword=keyword,
+            target_link=target_link,
+            username=username,
+            website_url=settings.website_url,
+        )
 
         async with httpx.AsyncClient(timeout=httpx.Timeout(20.0)) as client:
-            if target_link:
-                greeting = f"¡Hola @{username}! 💚" if username else "¡Hola! 💚"
-                dm_text = (
-                    f"{greeting} Gracias por comentar {keyword}.\n\n"
-                    f"Aquí tienes el enlace que solicitaste:\n{target_link}"
-                )
+            if dm_text:
                 dm_sent = await _send_private_dm(
                     client=client,
                     ig_user_id=settings.ig_user_id,
@@ -166,7 +218,7 @@ async def _process_comment_event(
                 )
             else:
                 logger.warning(
-                    "media_id=%s tiene keyword='%s' pero target_link vacío; se omite DM.",
+                    "media_id=%s tiene keyword='%s' pero dm_message y target_link vacíos; se omite DM.",
                     media_id,
                     keyword,
                 )

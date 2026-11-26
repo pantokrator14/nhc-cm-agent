@@ -220,6 +220,7 @@ async def publish_to_instagram(
     keyword: str = "",
     target_link: str = "",
     public_reply_text: str = "",
+    dm_message: str = "",
     state_path: Path | str | None = None,
     poll_interval: int = DEFAULT_POLL_INTERVAL_SECONDS,
     timeout_seconds: int = DEFAULT_POLL_TIMEOUT_SECONDS,
@@ -261,6 +262,7 @@ async def publish_to_instagram(
         keyword=keyword,
         target_link=target_link,
         public_reply_text=public_reply_text,
+        dm_message=dm_message,
         file_id=file_id,
         state_path=state_path,
     )
@@ -409,6 +411,7 @@ async def publish_carousel_to_instagram(
     keyword: str = "",
     target_link: str = "",
     public_reply_text: str = "",
+    dm_message: str = "",
     state_path: Path | str | None = None,
     poll_interval: int = DEFAULT_POLL_INTERVAL_SECONDS,
     timeout_seconds: int = DEFAULT_POLL_TIMEOUT_SECONDS,
@@ -502,6 +505,7 @@ async def publish_carousel_to_instagram(
         keyword=keyword,
         target_link=target_link,
         public_reply_text=public_reply_text,
+        dm_message=dm_message,
         file_id=file_id,
         state_path=state_path,
     )

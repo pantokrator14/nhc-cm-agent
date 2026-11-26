@@ -17,7 +17,7 @@ from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
 
-from config import resolve_timezone
+from config import DEFAULT_WEBSITE_URL, resolve_timezone
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +77,7 @@ Reglas editoriales y estratégicas obligatorias:
    - Redacta el `caption` (cuando no sea Historia) cumpliendo estrictamente TODAS estas características:
      * **Gancho SEO (primeros 125 caracteres)**: Arranca con una pregunta o afirmación directa usando palabras clave de salud metabólica (NO uses etiquetas comerciales como "keto" o "paleo").
      * **Cero venta fría en el texto**: PROHIBIDO usar frases como "Agenda tu cita", "Reserva tu consulta" o enlaces directos dentro del caption (reducen el alcance).
-     * **Disparador de comentarios (DM)**: Pide comentar una palabra clave exacta (ej. "Comenta PLAN, METABOLISMO, REINICIO o DETOX y te envío la guía al privado").
+     * **Disparador de comentarios (DM)**: Si aplica interacción por DM, pide comentar una palabra clave exacta (ej. "Comenta PLAN, METABOLISMO o ENERGÍA y te escribo al privado"). IMPORTANTE: No todo el tiempo enviamos PDFs o enlaces; solo promete enviar una guía/PDF si en las pautas o contexto existe un enlace real para ese recurso. En caso contrario, invita a comentar la palabra clave para recibir un mensaje cercano/orientación personalizada por DM.
      * **Llamado a guardar y compartir**: Pide explícitamente que guarden el post o se lo envíen a alguien.
      * **Extensión y estructura (3 a 4 párrafos cortos)**: No hagas captions largos; usa entre **3 y 4 párrafos cortos pero explicativos**, separados por línea en blanco.
      * **Emojis moderados**: Usa algunos emojis relacionados sin abusar.
@@ -89,7 +89,12 @@ Reglas editoriales y estratégicas obligatorias:
    - El sistema utiliza automáticamente el público guardado `'mujeres'` y la tarjeta configurada en la cuenta publicitaria.
    - Si `promote_in_ads = true`, define `ads_daily_budget_usd` (entre 3.0 y 10.0 USD) y `ads_duration_days` (entre 3 y 7 días), y explica en `ads_recommendation` objetivo y por qué conviene promocionarlo al público `'mujeres'`. Si es orgánico, pon `0.0` y `0`.
 6. Automatización de DM por comentario (Instagram):
-   - Solo activa `has_keyword_cta = true` si el copy invita explícitamente a comentar una palabra clave para enviar un recurso/enlace por DM (`keyword` en MAYÚSCULAS, `target_link`, `public_reply_text`). Si no aplica, `false` y `""`.
+   - Activa `has_keyword_cta = true` si el copy invita explícitamente a comentar una palabra clave para recibir respuesta o recurso por DM (`keyword` en MAYÚSCULAS, `dm_message`, `public_reply_text`, y `target_link`). Si no aplica, `false` y `""`.
+   - **REGLA NO NEGOCIABLE DEL MENSAJE DM (`dm_message`)**:
+     * **Si NO hay un PDF o enlace de recurso específico en las pautas**: `target_link` debe usar la página web oficial (`https://nelhealthcoach.com` o el `WEBSITE_URL` configurado), y `dm_message` **SIEMPRE** debe cerrar al final con un llamado a la acción atractivo invitando a visitar la página web junto con su enlace completo.
+     * **Si SÍ hay una guía PDF o enlace específico**: entrega ese enlace en `dm_message` y **además** incluye al final una invitación atractiva a visitar la página web (`https://nelhealthcoach.com`) para conocer más servicios/recursos.
+     * En ambos casos, redacta `dm_message` en español cercano y empático de Manuel (sin promesas médicas milagrosas y sin inventar enlaces de PDFs inexistentes).
+   - Si se incluyen ejemplos de DMs editados/aprobados previamente por Manuel (`APRENDIZAJE DE ESTILO EN DMs`), imita fielmente su tono, extensión, cercanía y estructura, manteniendo siempre la invitación + enlace a la página web al final.
 7. Publicación paralela orgánica en TikTok:
    - Para videos (`.mp4`), la publicación también puede enviarse a TikTok de forma **100% ORGÁNICA** (nunca promocionada ni con pauta pagada, incluso si `promote_in_ads = true` en Instagram).
    - Pon `publish_to_tiktok = true` para videos y `false` para imágenes estáticas.
@@ -103,6 +108,8 @@ Cuando Manuel pide un cambio sobre una propuesta:
 2. Si `force_apply` es False:
    - Razona críticamente el cambio pedido por Manuel evaluando: la regla estricta de contenido (videos grabados por Manuel a cámara = `MAIN` Lun/Mié/Vie; `PRO_TIP` Mar/Jue/Sáb = solo carrusel automático de textos/imágenes o imagen vertical de texto), horario óptimo según el tema, cumplimiento ético en salud, tendencias actuales de crecimiento orgánico, límite estricto de máximo 5 hashtags en Instagram y retorno en Meta Ads.
    - Para cualquier `caption` de feed (no Historias), mantén siempre: gancho SEO en los primeros 125 caracteres (sin keto/paleo), cero venta fría ni enlaces en el texto, disparador de comentario con palabra clave, llamado a guardar y compartir, **3 a 4 párrafos cortos pero explicativos** separados por línea en blanco, emojis moderados y el cierre exacto `Recuerda: tu comida, tu mejor medicina.` al final.
+   - Manuel también puede revisar o pedir cambios sobre el DM automático (`dm_message`), la palabra clave (`keyword`), el enlace (`target_link`) y la respuesta pública (`public_reply_text`). Si pide cambiar o reescribir el texto del DM, actualiza `proposal.dm_message` respetando su indicación (y mantén `has_keyword_cta = true` si sigue habiendo palabra clave/DM, asegurando siempre el llamado a la acción atractivo con el enlace a la página web al final del DM). Si pide eliminar el DM automático, pon `has_keyword_cta = false` y deja `keyword`, `target_link`, `public_reply_text` y `dm_message` vacíos.
+   - **Si se sugirió una guía PDF/recurso de Drive y Manuel dice que NO quiere usar ese PDF en esta pauta** (por ejemplo: "sin PDF", "no envíes guía", "quita el PDF", "no uses ese recurso"): ACEPTA el cambio de inmediato (`ai_assessment = "ACCEPTED"`), reemplaza `proposal.target_link` por la página web oficial (`https://nelhealthcoach.com`), elimina cualquier mención o promesa del PDF en `proposal.caption` y `proposal.dm_message`, y deja un `dm_message` conversacional que cierre con el llamado a la acción atractivo + enlace a la página web.
    - Si el cambio de Manuel es acertado o mejora la propuesta -> `ai_assessment = "ACCEPTED"`, aplícalo en `proposal` y explica en `reasoning_message` por qué es una buena decisión.
    - Si ves que lo que pide Manuel puede perjudicar el rendimiento (ej. mal horario para el tema, romper la cadencia semanal, perder el CTA, promocionar algo que funciona mejor orgánico, etc.) -> `ai_assessment = "ALTERNATIVE_SUGGESTED"`, explica claramente en `reasoning_message` por qué sugieres otra alternativa mejor, y entrega esa alternativa mejorada en `proposal` (para que Manuel decida si acepta tu alternativa o insiste en su cambio).
 """
@@ -199,6 +206,10 @@ class PostProposal(BaseModel):
     )
     target_link: str = Field(
         description="Enlace destino para enviar por DM según las pautas, o cadena vacía si no aplica."
+    )
+    dm_message: str = Field(
+        default="",
+        description="Mensaje privado completo y personalizado que se enviará por DM a quien comente la palabra clave (cercano, empático, en español, sin inventar URLs; incluye el enlace solo si existe `target_link`). Cadena vacía si has_keyword_cta=false.",
     )
     public_reply_text: str = Field(
         description="Respuesta corta pública al comentario cuando aplica keyword CTA, o cadena vacía."
@@ -490,12 +501,70 @@ def _normalize_media_type(
     return proposed_type
 
 
+def _extract_domain_hint(url: str) -> str:
+    clean = url.strip().lower()
+    clean = re.sub(r"^https?://", "", clean)
+    clean = re.sub(r"^www\.", "", clean)
+    return clean.split("/", 1)[0].strip()
+
+
+def ensure_dm_website_cta(
+    dm_message: str,
+    website_url: str = DEFAULT_WEBSITE_URL,
+) -> str:
+    """Guarantee that an active DM ends with an attractive invitation and website link."""
+    clean_dm = dm_message.strip()
+    clean_site = website_url.strip()
+    if not clean_dm or not clean_site:
+        return clean_dm
+
+    domain_hint = _extract_domain_hint(clean_site)
+    if clean_site.lower() in clean_dm.lower() or (domain_hint and domain_hint in clean_dm.lower()):
+        return clean_dm
+
+    return (
+        f"{clean_dm}\n\n"
+        "✨ Te invito a visitar nuestra página web para descubrir cómo podemos acompañarte a transformar tu salud y metabolismo:\n"
+        f"{clean_site}"
+    )
+
+
+def _default_dm_message(
+    keyword: str,
+    target_link: str = "",
+    website_url: str = DEFAULT_WEBSITE_URL,
+) -> str:
+    """Build a natural fallback DM when keyword CTA is enabled without custom `dm_message`."""
+    clean_kw = keyword.strip().upper()
+    clean_link = target_link.strip()
+    clean_site = website_url.strip() or DEFAULT_WEBSITE_URL
+    site_domain = _extract_domain_hint(clean_site)
+    link_is_website = bool(
+        clean_link
+        and (clean_link.rstrip("/").lower() == clean_site.rstrip("/").lower() or (site_domain and site_domain in clean_link.lower()))
+    )
+
+    if clean_link and not link_is_website:
+        base = (
+            f"¡Hola! 💚 Qué alegría leerte y gracias por comentar {clean_kw}.\n\n"
+            f"Aquí tienes el recurso que solicitaste:\n{clean_link}"
+        )
+        return ensure_dm_website_cta(base, clean_site)
+
+    base = (
+        f"¡Hola! 💚 Qué alegría leerte y gracias por comentar {clean_kw}.\n\n"
+        "Cuéntame por aquí cuál es tu mayor reto hoy con tu alimentación o metabolismo para poder orientarte mejor."
+    )
+    return ensure_dm_website_cta(base, clean_site)
+
+
 def _normalize_proposal(
     proposal: PostProposal,
     file_metadata: dict[str, Any],
     reference_now: datetime,
     *,
     allow_story_override: bool = False,
+    website_url: str = DEFAULT_WEBSITE_URL,
 ) -> PostProposal:
     media_type = _normalize_media_type(
         proposal.media_type,
@@ -515,8 +584,19 @@ def _normalize_proposal(
 
     keyword = proposal.keyword.strip().upper() if proposal.has_keyword_cta else ""
     has_cta = bool(proposal.has_keyword_cta and keyword)
+    clean_site = website_url.strip() or DEFAULT_WEBSITE_URL
     target_link = proposal.target_link.strip() if has_cta else ""
+    if has_cta and not target_link:
+        target_link = clean_site
     public_reply_text = proposal.public_reply_text.strip() if has_cta else ""
+    dm_message = proposal.dm_message.strip() if has_cta else ""
+    if has_cta:
+        if not dm_message:
+            dm_message = _default_dm_message(keyword, target_link, website_url=clean_site)
+        else:
+            if target_link and target_link != clean_site and target_link not in dm_message:
+                dm_message = f"{dm_message}\n\nAquí tienes el recurso solicitado:\n{target_link}"
+            dm_message = ensure_dm_website_cta(dm_message, clean_site)
 
     raw_short = re.sub(r"^\d+[\.\-\s:]+", "", proposal.short_title.strip())
     raw_short = re.sub(r"^pro\s*tip\s*\d*[\.\-\s:]+", "", raw_short, flags=re.IGNORECASE)
@@ -584,6 +664,7 @@ def _normalize_proposal(
         has_keyword_cta=has_cta,
         keyword=keyword if has_cta else "",
         target_link=target_link,
+        dm_message=dm_message,
         public_reply_text=public_reply_text,
         publish_to_tiktok=publish_to_tiktok,
         tiktok_caption=clean_tiktok_caption,
@@ -765,6 +846,9 @@ def generate_post_proposal(
     trends_brief: str | None = None,
     performance_memory: str = "",
     media_file_paths: list[Path] | None = None,
+    dm_learning_context: str = "",
+    website_url: str = DEFAULT_WEBSITE_URL,
+    resources_context: str = "",
 ) -> PostProposal:
     """Analyze the actual media file (when provided) + guidelines + live trends and propose a post."""
     now = current_time or datetime.now(resolve_timezone())
@@ -793,13 +877,25 @@ def generate_post_proposal(
         if performance_memory and performance_memory.strip()
         else ""
     )
+    dm_learning_section = (
+        f"\n=== APRENDIZAJE DE ESTILO EN DMs (EDICIONES PREVIAS DE MANUEL) ===\n{dm_learning_context.strip()}\n"
+        if dm_learning_context and dm_learning_context.strip()
+        else ""
+    )
+    resources_section = (
+        f"\n=== RECURSOS Y GUÍAS PDF DISPONIBLES EN DRIVE ===\n{resources_context.strip()}\n"
+        if resources_context and resources_context.strip()
+        else ""
+    )
 
     prompt = (
         f"Fecha y hora actual de referencia: {now.isoformat()}\n"
         f"Archivo nuevo SIN pauta previa: {file_name}\n\n"
         f"=== HORARIOS YA OCUPADOS EN PROPUESTAS/APROBADOS ===\n{occupied_block}\n\n"
         f"=== TENDENCIAS ACTUALES EN REDES SOCIALES (REELS/TIKTOK/SHORTS) ===\n{trends_section}\n"
-        f"{memory_section}\n"
+        f"{memory_section}"
+        f"{dm_learning_section}"
+        f"{resources_section}\n"
         f"=== PAUTAS DEL MES (REFERENCIA DE ESTILO, MARCA Y PUBLICACIONES EXISTENTES) ===\n{guidelines_text}\n\n"
         f"=== METADATOS DEL ARCHIVO EN DRIVE ===\n{file_meta_json}\n\n"
         "Analiza visualmente el archivo multimedia adjunto (si está disponible) y genera una propuesta inteligente:\n"
@@ -809,6 +905,7 @@ def generate_post_proposal(
         "- Adapta obligatoriamente (tanto para videos como para imágenes nuevas) el gancho (`hook_title`), el enfoque del `caption`, el `trend_alignment` y los hashtags para que esta pauta automática siga las tendencias actuales del momento y gane seguidores orgánicos.\n"
         "- Razona la mejor fecha y hora sin copiar ciegamente horas fijas anteriores.\n"
         "- OBLIGATORIO: Entrega exactamente 5 hashtags (NUNCA más de 5) en `hashtags`, y NO pongas hashtags dentro de `caption`.\n"
+        f"- OBLIGATORIO para DM (`dm_message`): si no hay un PDF específico para esa pauta, cierra el DM con un llamado a la acción atractivo invitando a visitar {website_url.strip() or DEFAULT_WEBSITE_URL} (con el enlace al final). Si sí hay un PDF, entrega el recurso y también invita a visitar {website_url.strip() or DEFAULT_WEBSITE_URL}.\n"
         "- Decide si amerita promoción en Meta Ads con presupuesto y duración sugeridos."
     )
 
@@ -865,7 +962,7 @@ def generate_post_proposal(
     else:
         raise GeminiAgentError("Gemini devolvió una respuesta vacía.")
 
-    return _normalize_proposal(proposal, file_metadata, now)
+    return _normalize_proposal(proposal, file_metadata, now, website_url=website_url)
 
 
 def revise_post_proposal(
@@ -879,6 +976,9 @@ def revise_post_proposal(
     force_apply: bool = False,
     revision_history: list[str] | None = None,
     trends_brief: str | None = None,
+    dm_learning_context: str = "",
+    website_url: str = DEFAULT_WEBSITE_URL,
+    resources_context: str = "",
 ) -> RevisionResult:
     """Critically evaluate admin change requests, reason alternatives, and respect insistence."""
     now = current_time or datetime.now(resolve_timezone())
@@ -898,6 +998,16 @@ def revise_post_proposal(
         if trends_brief and trends_brief.strip()
         else ""
     )
+    dm_learning_block = (
+        f"\n=== APRENDIZAJE DE ESTILO EN DMs (EDICIONES PREVIAS DE MANUEL) ===\n{dm_learning_context.strip()}\n"
+        if dm_learning_context and dm_learning_context.strip()
+        else ""
+    )
+    resources_block = (
+        f"\n=== RECURSOS Y GUÍAS PDF DISPONIBLES EN DRIVE ===\n{resources_context.strip()}\n"
+        if resources_context and resources_context.strip()
+        else ""
+    )
 
     prompt = (
         f"Fecha y hora actual de referencia: {now.isoformat()}\n"
@@ -905,7 +1015,9 @@ def revise_post_proposal(
         f"Modo force_apply (obedecer sin objetar): {force_apply}\n\n"
         f"=== HISTORIAL DE REVISIONES ===\n{history_block}\n\n"
         f"=== PAUTAS DEL MES (GOOGLE DOC) ===\n{guidelines_text}\n"
-        f"{trends_block}\n"
+        f"{trends_block}"
+        f"{dm_learning_block}"
+        f"{resources_block}\n"
         f"=== METADATOS DEL ARCHIVO EN DRIVE ===\n{file_meta_json}\n\n"
         f"=== PROPUESTA ANTERIOR ===\n{previous_json}\n\n"
         f"=== CAMBIO SOLICITADO POR MANUEL ===\n{feedback.strip()}\n\n"
@@ -950,14 +1062,38 @@ def revise_post_proposal(
     explicit_format_switch = bool(
         re.search(r"\b(reel|reels|feed|carrusel|imagen|publicaci[oó]n normal|historia|story|stories)\b", feedback, re.IGNORECASE)
     )
+    pdf_rejected = bool(
+        re.search(
+            r"\b(?:no|sin|quita|elimina|saca|remueve|om[ií]te|descarta)\b.{0,30}\b(?:pdf|gu[ií]a|archivo|recurso|enlace\s+de\s+drive)\b"
+            r"|\b(?:pdf|gu[ií]a|recurso)\b.{0,15}\bno\b",
+            feedback,
+            re.IGNORECASE,
+        )
+    )
+    candidate_proposal = result.proposal
+    if pdf_rejected and candidate_proposal.has_keyword_cta:
+        clean_site = website_url.strip() or DEFAULT_WEBSITE_URL
+        old_link = previous_proposal.target_link.strip()
+        cleaned_dm = candidate_proposal.dm_message
+        if old_link and old_link != clean_site:
+            cleaned_dm = cleaned_dm.replace(old_link, "").strip()
+            cleaned_dm = re.sub(r"\n{3,}", "\n\n", cleaned_dm).strip()
+        candidate_proposal = candidate_proposal.model_copy(
+            update={
+                "target_link": clean_site,
+                "dm_message": cleaned_dm,
+            }
+        )
+
     normalized = _normalize_proposal(
-        result.proposal,
+        candidate_proposal,
         file_metadata,
         now,
         allow_story_override=force_apply or explicit_format_switch,
+        website_url=website_url,
     )
     assessment: Literal["ACCEPTED", "ALTERNATIVE_SUGGESTED"] = (
-        "ACCEPTED" if force_apply else result.ai_assessment
+        "ACCEPTED" if (force_apply or pdf_rejected) else result.ai_assessment
     )
     return RevisionResult(
         ai_assessment=assessment,
@@ -1398,3 +1534,57 @@ def generate_ig_reply_suggestions(
         intent_summary=res.intent_summary.strip() or "Consulta de seguidor",
         options=clean_opts,
     )
+
+
+class ResourceSummaryResult(BaseModel):
+    """Concise summary and suggested DM keyword/usage for an uploaded Drive resource."""
+
+    summary: str = Field(
+        description="Resumen claro en 1-2 frases de qué trata el archivo o guía PDF."
+    )
+    suggested_use: str = Field(
+        description="Sugerencia breve de en qué tipo de pautas ofrecerlo por DM y una palabra clave sugerida."
+    )
+
+
+def summarize_uploaded_resource(
+    file_name: str,
+    preview_text: str = "",
+    api_key: str | None = None,
+    model: str | None = None,
+) -> tuple[str, str]:
+    """Summarize a newly uploaded PDF/guide from `Guías PDF y recursos` for Telegram & catalog."""
+    clean_preview = preview_text.strip()
+    if not clean_preview:
+        return (
+            f"Recurso '{file_name}' disponible para compartir por enlace.",
+            "Úsalo en pautas donde este tema aporte valor directo por DM.",
+        )
+    try:
+        client, resolved_model = _resolve_client_and_model(api_key, model)
+        prompt = (
+            f"Nombre del archivo subido a 'Guías PDF y recursos': {file_name}\n\n"
+            f"Extracto de contenido:\n{clean_preview[:2500]}\n\n"
+            "Resume brevemente de qué trata esta guía/recurso (1-2 frases claras en español) "
+            "y sugiere en qué tipo de publicación de @nelhealthcoach conviene ofrecerlo por DM (incluyendo 1 palabra clave sugerida en MAYÚSCULAS)."
+        )
+        response = client.models.generate_content(
+            model=resolved_model,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                response_schema=ResourceSummaryResult,
+                temperature=0.3,
+            ),
+        )
+        parsed = getattr(response, "parsed", None)
+        if isinstance(parsed, ResourceSummaryResult):
+            return parsed.summary.strip(), parsed.suggested_use.strip()
+        if response.text:
+            res = ResourceSummaryResult.model_validate_json(response.text)
+            return res.summary.strip(), res.suggested_use.strip()
+    except Exception as exc:
+        logger.debug("No se pudo resumir recurso '%s' con Gemini: %s", file_name, exc)
+
+    snippet = clean_preview[:220].rstrip() + ("..." if len(clean_preview) > 220 else "")
+    return snippet, "Disponible para enlazar en DMs cuando la pauta lo requiera."

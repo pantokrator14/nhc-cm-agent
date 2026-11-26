@@ -232,6 +232,11 @@ async def run_monthly_drive_review(
             logger.debug("No se pudieron revisar pautas atrasadas al inicio del ciclo: %s", exc)
 
         try:
+            await bot_controller.sync_and_notify_resources()
+        except Exception as res_exc:
+            logger.warning("No se pudo sincronizar carpeta de recursos PDF: %s", res_exc)
+
+        try:
             pending_files = await asyncio.to_thread(
                 list_pending_files,
                 month_folder_id,
@@ -496,6 +501,7 @@ async def run_agent(settings: Settings) -> None:
             await application.bot.set_my_commands(
                 [
                     BotCommand("check", "Escanear Drive ahora y proponer archivos nuevos"),
+                    BotCommand("recursos", "Ver y escanear Guías PDF y recursos en Drive"),
                     BotCommand("mensajes", "Revisar DMs y solicitudes de mensajes en Instagram"),
                     BotCommand("pautas", "Listar pautas del documento aún sin publicar"),
                     BotCommand("calendario", "Ver agenda editorial de los próximos 14 días"),
@@ -518,7 +524,7 @@ async def run_agent(settings: Settings) -> None:
                     "• Monitoreo diario preventivo de META_ACCESS_TOKEN activado\n"
                     "• Informe semanal de métricas: Domingos 20:00 hrs\n"
                     f"• Webhook IG en puerto {settings.webhook_port}\n"
-                    "Comandos: /check | /mensajes | /pautas | /calendario | /sugerencias | /guion | /metricas | /token | /id | /status"
+                    "Comandos: /check | /recursos | /mensajes | /pautas | /calendario | /sugerencias | /guion | /metricas | /token | /id | /status"
                 ),
                 parse_mode=ParseMode.HTML,
             )

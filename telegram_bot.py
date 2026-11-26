@@ -52,13 +52,17 @@ from drive_service import (
     ensure_current_month_folder,
     ensure_statistics_week_folder,
     find_unpublished_guidelines,
+    format_dm_learning_context,
     format_guideline_entry_lines,
+    format_resources_catalog_context,
+    get_dm_learning_memory,
     get_effective_meta_token,
     get_guidelines_text,
     get_monthly_doc_metadata,
     get_monthly_guidelines,
     get_next_location_label,
     get_performance_memory,
+    get_resources_catalog,
     get_scheduled_times_from_state,
     is_comment_processed,
     is_last_weekly_report_of_month,
@@ -70,6 +74,7 @@ from drive_service import (
     mark_file_state,
     mark_guideline_header_published,
     parse_guidelines_entries,
+    record_dm_learning_example,
     remove_scheduled_session,
     rename_drive_file,
     resolve_metrics_reference_dt,
@@ -77,7 +82,9 @@ from drive_service import (
     save_performance_memory,
     save_scheduled_session,
     set_temp_public_link,
+    sync_resources_folder,
     update_entry_in_monthly_doc,
+    update_resource_summary,
 )
 from gemini_agent import (
     MAX_INSTAGRAM_HASHTAGS,
@@ -87,6 +94,8 @@ from gemini_agent import (
     TrendPostIdea,
     TrendReport,
     VideoScriptResult,
+    _default_dm_message,
+    ensure_dm_website_cta,
     fetch_social_trends_brief,
     generate_ig_reply_suggestions,
     generate_post_proposal,
@@ -96,6 +105,7 @@ from gemini_agent import (
     is_story_filename,
     normalize_hashtags,
     revise_post_proposal,
+    summarize_uploaded_resource,
 )
 from meta_ads_service import (
     MetaAdsError,
@@ -143,6 +153,8 @@ class ProposalSession:
     message_id: int | None = None
     last_feedback: str = ""
     revision_history: list[str] = field(default_factory=list)
+    initial_dm_message: str = ""
+    dm_feedback_notes: list[str] = field(default_factory=list)
     is_existing_guideline: bool = False
     existing_doc_header: str = ""
     doc_header: str = ""
@@ -260,6 +272,7 @@ def _build_approval_keyboard(
     is_existing_guideline: bool = False,
     show_tiktok_toggle: bool = False,
     publish_to_tiktok: bool = True,
+    show_dm_edit: bool = True,
 ) -> InlineKeyboardMarkup:
     approve_label = (
         "✅ Guardar en Pautas y Programar"
@@ -303,6 +316,15 @@ def _build_approval_keyboard(
                 InlineKeyboardButton(
                     "⚡ Aplicar exactamente mi cambio",
                     callback_data=f"force_edit:{proposal_id}",
+                )
+            ]
+        )
+    if show_dm_edit:
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    "✉️ Editar mensaje DM",
+                    callback_data=f"edit_dm:{proposal_id}",
                 )
             ]
         )
@@ -376,6 +398,11 @@ def _format_proposal_html(
         if p.has_keyword_cta and p.public_reply_text
         else "N/A"
     )
+    dm_message_display = (
+        f"\n<i>{html.escape(p.dm_message)}</i>"
+        if p.has_keyword_cta and p.dm_message
+        else " N/A"
+    )
     caption = html.escape(p.caption)
     hashtag_list = p.hashtags.split()
     hashtags = html.escape(p.hashtags)
@@ -448,7 +475,8 @@ def _format_proposal_html(
             + f"🎵 <b>TikTok (Orgánico):</b> {html.escape(tiktok_badge)}\n"
             f"🔑 <b>Palabra clave (IG):</b> <code>{keyword_display}</code>\n"
             f"🔗 <b>Enlace DM:</b> {link_display}\n"
-            f"💬 <b>Respuesta pública:</b> {reply_display}\n\n"
+            f"💬 <b>Respuesta pública:</b> {reply_display}\n"
+            f"✉️ <b>Mensaje DM automático:</b>{dm_message_display}\n\n"
             f"📝 <b>Caption sugerido:</b>\n"
         )
         hashtags_block = (
@@ -485,6 +513,7 @@ class NelHealthCoachBot:
         self.pending_proposals: dict[str, ProposalSession] = {}
         self.awaiting_feedback_proposal_id: str | None = None
         self.awaiting_feedback_by_chat: dict[int, str] = {}
+        self.awaiting_dm_edit_by_chat: dict[int, str] = {}
         self.cached_unpublished_pautas: dict[str, UnpublishedGuidelineItem] = {}
         self.cached_pautas_month_folder_id: str = ""
         self.cached_pautas_guidelines_text: str = ""
@@ -512,6 +541,8 @@ class NelHealthCoachBot:
             "doc_header": session.doc_header,
             "technical_note": session.technical_note,
             "location_label": session.location_label,
+            "initial_dm_message": session.initial_dm_message,
+            "dm_feedback_notes": list(session.dm_feedback_notes),
         }
 
     async def _persist_scheduled_session(self, session: ProposalSession) -> None:
@@ -551,6 +582,8 @@ class NelHealthCoachBot:
                     doc_header=str(payload.get("doc_header", "")),
                     technical_note=str(payload.get("technical_note", "")),
                     location_label="" if proposal.media_type == "STORIES" else "California",
+                    initial_dm_message=str(payload.get("initial_dm_message", proposal.dm_message)),
+                    dm_feedback_notes=[str(n) for n in (payload.get("dm_feedback_notes") or [])],
                 )
             except Exception as exc:
                 logger.warning("No se pudo restaurar sesión programada %s: %s", proposal_id, exc)
@@ -618,7 +651,119 @@ class NelHealthCoachBot:
                 and session.proposal.media_type != "STORIES"
             ),
             publish_to_tiktok=session.proposal.publish_to_tiktok,
+            show_dm_edit=(session.proposal.media_type != "STORIES"),
         )
+
+    def _load_dm_learning_context_sync(self) -> str:
+        try:
+            mem = get_dm_learning_memory(self.settings.state_file_path)
+            return format_dm_learning_context(mem)
+        except Exception:
+            return ""
+
+    def _load_resources_context_sync(self) -> str:
+        try:
+            catalog = get_resources_catalog(self.settings.state_file_path)
+            return format_resources_catalog_context(catalog)
+        except Exception:
+            return ""
+
+    async def sync_and_notify_resources(self) -> Any:
+        """Scan `Guías PDF y recursos`, register new files, and notify admins via Telegram."""
+        result = await asyncio.to_thread(
+            sync_resources_folder,
+            root_folder_id=self.settings.drive_root_folder_id,
+            resources_folder_id=self.settings.drive_resources_folder_id,
+            resources_folder_name=self.settings.drive_resources_folder_name,
+            state_path=self.settings.state_file_path,
+            credentials_path=self.settings.google_application_credentials,
+            create_if_missing=True,
+        )
+        if result.folder_created and result.folder_id:
+            folder_url = f"https://drive.google.com/drive/folders/{result.folder_id}"
+            await self.notify_info(
+                f"📁 <b>Carpeta universal conectada:</b> <code>{html.escape(result.folder_name)}</code>\n"
+                "Ya puedes subir ahí tus guías en PDF o documentos de apoyo. Cuando subas un archivo nuevo te avisaré por aquí.\n\n"
+                f"🔗 <a href=\"{folder_url}\">Abrir {html.escape(result.folder_name)} en Google Drive</a>"
+            )
+
+        for item in result.newly_added:
+            fname = str(item.get("name", "Archivo"))
+            fid = str(item.get("file_id", ""))
+            url = str(item.get("url", ""))
+            preview = str(item.get("preview_text", ""))
+            summary, suggested = await asyncio.to_thread(
+                summarize_uploaded_resource,
+                fname,
+                preview,
+                self.settings.gemini_api_key,
+                self.settings.gemini_model,
+            )
+            if fid:
+                await asyncio.to_thread(
+                    update_resource_summary,
+                    fid,
+                    summary,
+                    suggested,
+                    self.settings.state_file_path,
+                )
+            folder_url = (
+                f"https://drive.google.com/drive/folders/{result.folder_id}"
+                if result.folder_id
+                else ""
+            )
+            msg_lines = [
+                f"📚 <b>Nuevo archivo subido a <code>{html.escape(result.folder_name)}</code></b>\n",
+                f"📄 <b>Archivo:</b> <code>{html.escape(fname)}</code>",
+            ]
+            if url:
+                msg_lines.append(f"🔗 <b>Enlace para DMs (lectura/descarga):</b> {html.escape(url)}")
+            if summary:
+                msg_lines.append(f"📝 <b>Resumen:</b> {html.escape(summary)}")
+            if suggested:
+                msg_lines.append(f"💡 <b>Uso sugerido en DMs:</b> {html.escape(suggested)}")
+            if folder_url:
+                msg_lines.append(f"\n📂 <a href=\"{folder_url}\">Abrir carpeta {html.escape(result.folder_name)}</a>")
+            await self.notify_info("\n".join(msg_lines))
+
+        return result
+
+    async def _record_dm_learning_if_changed(
+        self,
+        session: ProposalSession,
+        previous_dm: str = "",
+        feedback: str = "",
+    ) -> bool:
+        p = session.proposal
+        current_dm = p.dm_message.strip()
+        if not p.has_keyword_cta or not current_dm:
+            return False
+        if (
+            current_dm == previous_dm.strip()
+            and current_dm == session.initial_dm_message.strip()
+            and not feedback.strip()
+        ):
+            return False
+
+        clean_feedback = feedback.strip()
+        if clean_feedback and clean_feedback not in session.dm_feedback_notes:
+            session.dm_feedback_notes.append(clean_feedback)
+        try:
+            return await asyncio.to_thread(
+                record_dm_learning_example,
+                proposal_id=session.proposal_id,
+                updated_dm=current_dm,
+                previous_dm=session.initial_dm_message or previous_dm,
+                feedback=clean_feedback,
+                keyword=p.keyword,
+                post_title=p.short_title or session.existing_doc_header,
+                target_link=p.target_link,
+                public_reply_text=p.public_reply_text,
+                state_path=self.settings.state_file_path,
+            )
+        except Exception as exc:
+            logger.warning("No se pudo guardar aprendizaje de DM: %s", exc)
+            return False
 
     def _get_reference_now(self) -> datetime:
         return datetime.now(self.settings.tzinfo)
@@ -870,6 +1015,20 @@ class NelHealthCoachBot:
             else normalize_hashtags(entry.hashtags, max_count=MAX_INSTAGRAM_HASHTAGS)
         )
 
+        resolved_dm = entry.dm_message.strip()
+        resolved_link = entry.target_link.strip()
+        if entry.has_keyword_cta and entry.keyword:
+            if not resolved_link:
+                resolved_link = self.settings.website_url
+            if not resolved_dm:
+                resolved_dm = _default_dm_message(
+                    entry.keyword,
+                    resolved_link,
+                    website_url=self.settings.website_url,
+                )
+            else:
+                resolved_dm = ensure_dm_website_cta(resolved_dm, self.settings.website_url)
+
         proposal = PostProposal(
             content_summary=f"Pauta existente del documento: {entry.header}",
             has_presenter_on_camera=(entry.post_category == "MAIN" and is_video),
@@ -888,8 +1047,9 @@ class NelHealthCoachBot:
             ads_recommendation=entry.ads_raw or ("Orgánico." if not entry.promote_in_ads else "Meta Ads."),
             has_keyword_cta=entry.has_keyword_cta,
             keyword=entry.keyword,
-            target_link=entry.target_link,
-            public_reply_text="",
+            target_link=resolved_link,
+            dm_message=resolved_dm,
+            public_reply_text=entry.public_reply_text,
             publish_to_tiktok=is_video and not is_story,
             tiktok_caption="" if is_story else (entry.caption or entry.hook_title or entry.short_title),
         )
@@ -900,6 +1060,7 @@ class NelHealthCoachBot:
             file_metadata=dict(drive_file),
             guidelines_text=guidelines_text,
             proposal=proposal,
+            initial_dm_message=resolved_dm,
             is_existing_guideline=True,
             existing_doc_header=entry.header,
         )
@@ -937,6 +1098,8 @@ class NelHealthCoachBot:
             perf_memory = str(mem_data.get("winning_insights", "")).strip()
         except Exception:
             perf_memory = ""
+        dm_learning_ctx = await asyncio.to_thread(self._load_dm_learning_context_sync)
+        resources_ctx = await asyncio.to_thread(self._load_resources_context_sync)
 
         for file_meta in pending_files:
             file_id = file_meta["id"]
@@ -1021,6 +1184,9 @@ class NelHealthCoachBot:
                     trends_brief,
                     perf_memory,
                     temp_media_paths if is_carousel else None,
+                    dm_learning_ctx,
+                    self.settings.website_url,
+                    resources_ctx,
                 )
                 occupied_slots.append(proposal.scheduled_time)
 
@@ -1040,6 +1206,7 @@ class NelHealthCoachBot:
                     file_metadata=file_meta,
                     guidelines_text=guidelines_text,
                     proposal=proposal,
+                    initial_dm_message=proposal.dm_message,
                     technical_note=technical_note,
                     location_label=next_loc_label,
                 )
@@ -1158,6 +1325,8 @@ class NelHealthCoachBot:
                 self.awaiting_feedback_proposal_id = None
             for k_cid in [k for k, v in self.awaiting_feedback_by_chat.items() if v == proposal_id]:
                 self.awaiting_feedback_by_chat.pop(k_cid, None)
+            for k_cid in [k for k, v in self.awaiting_dm_edit_by_chat.items() if v == proposal_id]:
+                self.awaiting_dm_edit_by_chat.pop(k_cid, None)
 
             if not session.is_existing_guideline and session.file_metadata.get("id"):
                 await asyncio.to_thread(
@@ -1187,11 +1356,33 @@ class NelHealthCoachBot:
             return
 
         if action == "edit":
+            self.awaiting_dm_edit_by_chat.pop(chat_id, None)
             self.awaiting_feedback_proposal_id = proposal_id
             self.awaiting_feedback_by_chat[chat_id] = proposal_id
             await query.message.reply_text(
-                f"✏️ Escribe los cambios que deseas para <b>{html.escape(file_name)}</b>.\n"
+                f"✏️ Escribe los cambios que deseas para <b>{html.escape(file_name)}</b> "
+                "(caption, horario, Meta Ads, palabra clave, mensaje DM, etc.).\n"
                 "Analizaré tu solicitud con criterio estratégico (y si insistes, aplicaré exactamente lo que indiques).",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        if action == "edit_dm":
+            self.awaiting_feedback_by_chat.pop(chat_id, None)
+            if self.awaiting_feedback_proposal_id == proposal_id:
+                self.awaiting_feedback_proposal_id = None
+            self.awaiting_dm_edit_by_chat[chat_id] = proposal_id
+            kw_now = session.proposal.keyword or "INFO"
+            dm_now = session.proposal.dm_message or "(aún vacío)"
+            link_now = session.proposal.target_link or "Ninguno"
+            await query.message.reply_text(
+                f"✉️ <b>Editar mensaje DM automático</b> para <b>{html.escape(file_name)}</b>\n\n"
+                f"🔑 <b>Palabra clave actual:</b> <code>{html.escape(kw_now)}</code>\n"
+                f"🔗 <b>Enlace actual:</b> {html.escape(link_now)}\n"
+                f"📝 <b>Mensaje DM actual:</b>\n<code>{html.escape(dm_now)}</code>\n\n"
+                "Envía el <b>texto exacto</b> que quieres que el bot responda por DM privado a quien comente la palabra clave "
+                "(o escribe <code>cancelar</code> para salir).\n"
+                "<i>💡 Tip: Puedes usar <code>{username}</code> si quieres mencionar el @usuario. El agente aprenderá de tu edición para futuras pautas.</i>",
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -1210,6 +1401,9 @@ class NelHealthCoachBot:
                 fallback_query=query,
             )
             try:
+                prev_dm = session.proposal.dm_message
+                dm_learning_ctx = await asyncio.to_thread(self._load_dm_learning_context_sync)
+                resources_ctx = await asyncio.to_thread(self._load_resources_context_sync)
                 revision: RevisionResult = await asyncio.to_thread(
                     revise_post_proposal,
                     session.guidelines_text,
@@ -1221,12 +1415,24 @@ class NelHealthCoachBot:
                     self.settings.gemini_model,
                     True,
                     session.revision_history,
+                    None,
+                    dm_learning_ctx,
+                    self.settings.website_url,
+                    resources_ctx,
                 )
                 session.proposal = revision.proposal
+                learned = await self._record_dm_learning_if_changed(
+                    session,
+                    previous_dm=prev_dm,
+                    feedback=session.last_feedback,
+                )
+                note = revision.reasoning_message
+                if learned:
+                    note = f"{note}\n🧠 Aprendí de tu edición en el DM para futuras propuestas.".strip()
                 await self._send_session_card(
                     session,
                     header="✅ Cambio aplicado exactamente según tu indicación",
-                    ai_note=revision.reasoning_message,
+                    ai_note=note,
                     reply_markup=self._build_session_keyboard(session, show_force_apply=False),
                 )
             except Exception as exc:
@@ -1237,6 +1443,8 @@ class NelHealthCoachBot:
         if action == "save_doc_only":
             if self.awaiting_feedback_proposal_id == proposal_id:
                 self.awaiting_feedback_proposal_id = None
+            for k_cid in [k for k, v in self.awaiting_dm_edit_by_chat.items() if v == proposal_id]:
+                self.awaiting_dm_edit_by_chat.pop(k_cid, None)
             try:
                 scheduled_dt = datetime.fromisoformat(session.proposal.scheduled_time)
             except ValueError as exc:
@@ -1251,6 +1459,10 @@ class NelHealthCoachBot:
                     self._record_approval_in_drive_sync,
                     session,
                     scheduled_dt,
+                )
+                await self._record_dm_learning_if_changed(
+                    session,
+                    previous_dm=session.initial_dm_message,
                 )
                 await query.edit_message_text(
                     text=self._format_session_html(
@@ -1268,6 +1480,8 @@ class NelHealthCoachBot:
         if action == "approve":
             if self.awaiting_feedback_proposal_id == proposal_id:
                 self.awaiting_feedback_proposal_id = None
+            for k_cid in [k for k, v in self.awaiting_dm_edit_by_chat.items() if v == proposal_id]:
+                self.awaiting_dm_edit_by_chat.pop(k_cid, None)
 
             try:
                 scheduled_dt = datetime.fromisoformat(session.proposal.scheduled_time)
@@ -1331,6 +1545,10 @@ class NelHealthCoachBot:
             )
 
             await self._persist_scheduled_session(session)
+            await self._record_dm_learning_if_changed(
+                session,
+                previous_dm=session.initial_dm_message,
+            )
 
             self.scheduler.add_job(
                 self.execute_publication,
@@ -1421,6 +1639,8 @@ class NelHealthCoachBot:
                 has_keyword_cta=p.has_keyword_cta,
                 keyword=p.keyword,
                 target_link=p.target_link,
+                dm_message=p.dm_message,
+                public_reply_text=p.public_reply_text,
                 is_story=(p.media_type == "STORIES"),
             )
             if session.is_existing_guideline and session.existing_doc_header:
@@ -1518,6 +1738,56 @@ class NelHealthCoachBot:
             )
             return
 
+        dm_edit_proposal_id = self.awaiting_dm_edit_by_chat.pop(chat_id, None)
+        if dm_edit_proposal_id:
+            session = self.pending_proposals.get(dm_edit_proposal_id)
+            if session is None or session.status != "pending":
+                await message.reply_text("ℹ️ Esa propuesta ya no está pendiente de edición.")
+                return
+            raw_dm = message.text.strip()
+            if raw_dm.lower() in {"cancelar", "/cancel", "salir"}:
+                await message.reply_text("❎ Edición de mensaje DM cancelada.")
+                return
+            if not raw_dm:
+                self.awaiting_dm_edit_by_chat[chat_id] = dm_edit_proposal_id
+                await message.reply_text("⚠️ El mensaje DM está vacío. Envía el texto que deseas usar.")
+                return
+
+            prev_dm = session.proposal.dm_message
+            session.proposal.dm_message = ensure_dm_website_cta(
+                raw_dm,
+                self.settings.website_url,
+            )
+            if not session.proposal.has_keyword_cta:
+                session.proposal.has_keyword_cta = True
+            if not session.proposal.keyword.strip():
+                title_tokens = re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+", session.proposal.short_title or "")
+                session.proposal.keyword = (title_tokens[-1] if title_tokens else "INFO").upper()
+            existing_link = session.proposal.target_link.strip()
+            if not existing_link or existing_link not in raw_dm:
+                session.proposal.target_link = self.settings.website_url
+
+            learned = await self._record_dm_learning_if_changed(
+                session,
+                previous_dm=prev_dm,
+                feedback=f"Edición directa de Manuel para el DM de '{session.proposal.short_title}'",
+            )
+            await self._sync_proposal_cards(
+                session,
+                header="🔄 Propuesta anterior reemplazada por edición de DM",
+                reply_markup=None,
+            )
+            ai_note = "Mensaje DM actualizado exactamente con tu texto."
+            if learned:
+                ai_note += "\n🧠 Guardé este ejemplo en memoria para que las futuras propuestas generen DMs más acordes a tu estilo."
+            await self._send_session_card(
+                session,
+                header="✉️ Mensaje DM actualizado",
+                ai_note=ai_note,
+                reply_markup=self._build_session_keyboard(session),
+            )
+            return
+
         proposal_id = self.awaiting_feedback_by_chat.pop(chat_id, None) or self.awaiting_feedback_proposal_id
         if not proposal_id or proposal_id not in self.pending_proposals:
             await message.reply_text(
@@ -1555,6 +1825,9 @@ class NelHealthCoachBot:
                     exc,
                 )
 
+            prev_dm = session.proposal.dm_message
+            dm_learning_ctx = await asyncio.to_thread(self._load_dm_learning_context_sync)
+            resources_ctx = await asyncio.to_thread(self._load_resources_context_sync)
             revision: RevisionResult = await asyncio.to_thread(
                 revise_post_proposal,
                 session.guidelines_text,
@@ -1566,8 +1839,17 @@ class NelHealthCoachBot:
                 self.settings.gemini_model,
                 False,
                 session.revision_history,
+                None,
+                dm_learning_ctx,
+                self.settings.website_url,
+                resources_ctx,
             )
             session.proposal = revision.proposal
+            learned = await self._record_dm_learning_if_changed(
+                session,
+                previous_dm=prev_dm,
+                feedback=feedback,
+            )
 
             await self._sync_proposal_cards(
                 session,
@@ -1581,10 +1863,13 @@ class NelHealthCoachBot:
                 if is_alternative
                 else "✏️ Propuesta actualizada"
             )
+            note = revision.reasoning_message
+            if learned:
+                note = f"{note}\n🧠 Aprendí de tu edición en el DM para futuras propuestas.".strip()
             await self._send_session_card(
                 session,
                 header=header,
-                ai_note=revision.reasoning_message,
+                ai_note=note,
                 reply_markup=self._build_session_keyboard(
                     session,
                     show_force_apply=is_alternative,
@@ -1664,6 +1949,7 @@ class NelHealthCoachBot:
                     keyword=proposal.keyword,
                     target_link=proposal.target_link,
                     public_reply_text=proposal.public_reply_text,
+                    dm_message=proposal.dm_message,
                     state_path=self.settings.state_file_path,
                 )
             else:
@@ -1687,6 +1973,7 @@ class NelHealthCoachBot:
                     keyword=proposal.keyword,
                     target_link=proposal.target_link,
                     public_reply_text=proposal.public_reply_text,
+                    dm_message=proposal.dm_message,
                     state_path=self.settings.state_file_path,
                 )
 
@@ -1833,7 +2120,8 @@ class NelHealthCoachBot:
             )
 
             dm_summary = (
-                f"Activa en webhook (keyword={proposal.keyword})"
+                f"Activa en webhook (keyword={proposal.keyword}"
+                + (", con mensaje DM personalizado)" if proposal.dm_message.strip() else ")")
                 if proposal.has_keyword_cta
                 else "No requerida (sin palabra clave)"
             )
@@ -2029,6 +2317,13 @@ class NelHealthCoachBot:
             else ""
         )
         when_str = " ".join(p for p in (entry.fecha_raw, entry.horario_raw) if p) or "Sin fecha"
+        dm_block = ""
+        if entry.has_keyword_cta and entry.keyword:
+            dm_block = (
+                f"\n🔑 <b>Palabra clave DM:</b> <code>{html.escape(entry.keyword)}</code>"
+                + (f"\n🔗 <b>Enlace DM:</b> {html.escape(entry.target_link)}" if entry.target_link else "")
+                + (f"\n✉️ <b>Mensaje DM:</b> <i>{html.escape(entry.dm_message)}</i>" if entry.dm_message else "")
+            )
 
         text = (
             f"📌 <b>{html.escape(entry.header)}</b>\n\n"
@@ -2036,7 +2331,8 @@ class NelHealthCoachBot:
             f"📁 <b>Archivo Drive:</b> <code>{html.escape(file_name)}</code>\n"
             f"🕒 <b>Fecha/Hora actual:</b> <code>{html.escape(when_str)}</code>\n"
             f"📣 <b>Meta Ads:</b> {html.escape(entry.ads_raw or 'Orgánico')}\n"
-            f"🎯 <b>Gancho / Título:</b> {html.escape(entry.hook_title or 'N/A')}\n\n"
+            f"🎯 <b>Gancho / Título:</b> {html.escape(entry.hook_title or 'N/A')}"
+            f"{dm_block}\n\n"
             f"📝 <b>Caption actual:</b>\n{html.escape(entry.caption or 'N/A')}\n\n"
             f"🏷️ <b>Hashtags:</b> {html.escape(norm_tags or entry.hashtags or 'Ninguno')}{tag_warn}"
         )
@@ -2125,7 +2421,7 @@ class NelHealthCoachBot:
             await self._send_admin_message(
                 f"✏️ Editando <b>{html.escape(entry.header)}</b> (<code>{html.escape(file_name)}</code>).\n\n"
                 "Escribe qué deseas cambiar (por ejemplo: <i>'Muévelo para hoy a las 19:00, "
-                "actualiza el caption con enfoque en tendencias y deja 5 hashtags'</i>)."
+                "actualiza el caption con enfoque en tendencias, cambia el mensaje DM o deja 5 hashtags'</i>)."
             )
             return
 
@@ -2163,6 +2459,10 @@ class NelHealthCoachBot:
                 self.settings.state_file_path,
             )
             await self._persist_scheduled_session(session)
+            await self._record_dm_learning_if_changed(
+                session,
+                previous_dm=session.initial_dm_message,
+            )
             self.scheduler.add_job(
                 self.execute_publication,
                 trigger=DateTrigger(run_date=run_date),
@@ -2758,6 +3058,7 @@ class NelHealthCoachBot:
             f"desde el webhook (puerto <b>{self.settings.webhook_port}</b>).\n"
             "Comandos disponibles:\n"
             "• /check — Escanear la carpeta del mes, detectar pautas atrasadas y proponer archivos nuevos\n"
+            "• /recursos — Escanear y listar archivos en Guías PDF y recursos en Drive\n"
             "• /mensajes (o /dms) — Revisar DMs y solicitudes de mensajes pendientes en Instagram\n"
             "• /pautas — Listar pautas del documento aún sin publicar (editar fecha, caption o publicar)\n"
             "• /calendario — Ver agenda y huecos libres de los próximos 14 días\n"
@@ -2785,6 +3086,57 @@ class NelHealthCoachBot:
                 await self.scan_callback()
         else:
             logger.warning("cmd_check invocado sin scan_callback configurado.")
+
+    async def cmd_recursos(
+        self,
+        update: Update,
+        context: ContextTypes.DEFAULT_TYPE,
+    ) -> None:
+        if not self._is_authorized_admin(update):
+            return
+        await update.effective_message.reply_text(
+            f"📚 Escaneando carpeta <code>{html.escape(self.settings.drive_resources_folder_name)}</code> en Drive...",
+            parse_mode=ParseMode.HTML,
+        )
+        try:
+            res = await self.sync_and_notify_resources()
+            catalog = await asyncio.to_thread(get_resources_catalog, self.settings.state_file_path)
+            folder_url = (
+                f"https://drive.google.com/drive/folders/{res.folder_id}"
+                if res.folder_id
+                else ""
+            )
+            if not catalog:
+                link_line = (
+                    f"\n\n🔗 <a href=\"{folder_url}\">Abrir {html.escape(res.folder_name)} en Google Drive</a>"
+                    if folder_url
+                    else ""
+                )
+                await update.effective_message.reply_text(
+                    f"📂 La carpeta <b>{html.escape(res.folder_name)}</b> está conectada, pero aún no tiene archivos.{link_line}",
+                    parse_mode=ParseMode.HTML,
+                )
+                return
+
+            lines = [
+                f"📚 <b>{html.escape(res.folder_name)}</b> ({len(catalog)} archivo(s) disponible(s)):\n"
+            ]
+            for idx, item in enumerate(catalog[:15], start=1):
+                name = html.escape(str(item.get("name", "Recurso")))
+                url = html.escape(str(item.get("url", "")))
+                summary = html.escape(str(item.get("summary", "")))
+                entry_line = f"{idx}. <code>{name}</code>"
+                if url:
+                    entry_line += f"\n   🔗 {url}"
+                if summary:
+                    entry_line += f"\n   📝 <i>{summary}</i>"
+                lines.append(entry_line)
+            if folder_url:
+                lines.append(f"\n📂 <a href=\"{folder_url}\">Abrir carpeta en Google Drive</a>")
+            await self._send_long_html_message("\n".join(lines))
+        except Exception as exc:
+            logger.exception("Error ejecutando /recursos: %s", exc)
+            await self.notify_error(f"Error consultando Guías PDF y recursos: {exc}")
 
     async def cmd_pautas(
         self,
@@ -3669,6 +4021,7 @@ def register_handlers(application: Application, bot_controller: NelHealthCoachBo
     bot_controller.application = application
     application.add_handler(CommandHandler(["start", "help"], bot_controller.cmd_start))
     application.add_handler(CommandHandler("check", bot_controller.cmd_check))
+    application.add_handler(CommandHandler(["recursos", "pdfs", "guias"], bot_controller.cmd_recursos))
     application.add_handler(CommandHandler(["mensajes", "dms", "inbox"], bot_controller.cmd_mensajes))
     application.add_handler(CommandHandler(["pautas", "pendientes"], bot_controller.cmd_pautas))
     application.add_handler(CommandHandler("calendario", bot_controller.cmd_calendario))

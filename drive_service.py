@@ -401,6 +401,8 @@ def _empty_state() -> dict[str, Any]:
         "location_state": {"next_index": 0, "cache": {}},
         "scheduled_sessions": {},
         "performance_memory": {},
+        "dm_learning_memory": {"examples": []},
+        "resource_files": {},
         "rollover_months": {},
     }
 
@@ -436,6 +438,16 @@ def _normalize_state_shape(data: Any) -> dict[str, Any]:
         "performance_memory": (
             data["performance_memory"]
             if isinstance(data.get("performance_memory"), dict)
+            else {}
+        ),
+        "dm_learning_memory": (
+            data["dm_learning_memory"]
+            if isinstance(data.get("dm_learning_memory"), dict)
+            else {"examples": []}
+        ),
+        "resource_files": (
+            data["resource_files"]
+            if isinstance(data.get("resource_files"), dict)
             else {}
         ),
         "rollover_months": (
@@ -779,6 +791,7 @@ def save_published_media(
     public_reply_text: str,
     file_id: str | None = None,
     state_path: Path | str | None = None,
+    dm_message: str = "",
 ) -> None:
     """Persist published Instagram `media_id` and DM automation metadata in `state.json`."""
     path = _get_state_path(state_path)
@@ -793,10 +806,122 @@ def save_published_media(
             "has_keyword_cta": bool(has_keyword_cta),
             "keyword": keyword.strip().upper() if has_keyword_cta else "",
             "target_link": target_link.strip() if has_keyword_cta else "",
+            "dm_message": dm_message.strip() if has_keyword_cta else "",
             "public_reply_text": public_reply_text.strip() if has_keyword_cta else "",
             "published_at": datetime.now(timezone.utc).isoformat(),
         }
         _save_state_unlocked(state, path)
+
+
+def get_dm_learning_memory(state_path: Path | str | None = None) -> dict[str, Any]:
+    """Return stored admin DM edit examples and style preferences from `state.json`."""
+    state = load_state(state_path)
+    mem = state.get("dm_learning_memory")
+    if isinstance(mem, dict):
+        examples = mem.get("examples")
+        return {
+            "examples": list(examples) if isinstance(examples, list) else [],
+        }
+    return {"examples": []}
+
+
+def record_dm_learning_example(
+    *,
+    proposal_id: str,
+    updated_dm: str,
+    previous_dm: str = "",
+    feedback: str = "",
+    keyword: str = "",
+    post_title: str = "",
+    target_link: str = "",
+    public_reply_text: str = "",
+    state_path: Path | str | None = None,
+    max_examples: int = 12,
+) -> bool:
+    """Upsert an admin-edited DM example in `state.json` so future proposals match Manuel's tone."""
+    clean_updated = updated_dm.strip()
+    if not clean_updated:
+        return False
+
+    path = _get_state_path(state_path)
+    with _STATE_LOCK:
+        try:
+            state = _read_state_unlocked(path)
+        except DriveServiceError:
+            state = _empty_state()
+
+        raw_mem = state.get("dm_learning_memory")
+        examples_raw = raw_mem.get("examples") if isinstance(raw_mem, dict) else []
+        examples: list[dict[str, Any]] = [
+            dict(item) for item in (examples_raw or []) if isinstance(item, dict)
+        ]
+
+        existing_entry = next(
+            (item for item in examples if str(item.get("proposal_id", "")) == str(proposal_id)),
+            None,
+        )
+        initial_dm = (
+            str(existing_entry.get("initial_dm", "")).strip()
+            if existing_entry is not None
+            else previous_dm.strip()
+        )
+        notes: list[str] = (
+            [str(n) for n in existing_entry.get("feedback_notes", []) if str(n).strip()]
+            if existing_entry is not None and isinstance(existing_entry.get("feedback_notes"), list)
+            else []
+        )
+        clean_feedback = feedback.strip()
+        if clean_feedback and clean_feedback not in notes:
+            notes.append(clean_feedback)
+
+        examples = [
+            item for item in examples if str(item.get("proposal_id", "")) != str(proposal_id)
+        ]
+        examples.append(
+            {
+                "proposal_id": str(proposal_id),
+                "post_title": post_title.strip(),
+                "keyword": keyword.strip().upper(),
+                "target_link": target_link.strip(),
+                "initial_dm": initial_dm,
+                "approved_dm": clean_updated,
+                "public_reply_text": public_reply_text.strip(),
+                "feedback_notes": notes[-5:],
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+        if len(examples) > max_examples:
+            examples = examples[-max_examples:]
+
+        state["dm_learning_memory"] = {"examples": examples}
+        _save_state_unlocked(state, path)
+    return True
+
+
+def format_dm_learning_context(memory_data: dict[str, Any], limit: int = 6) -> str:
+    """Format stored DM edit examples into a concise prompt block for Gemini."""
+    examples = memory_data.get("examples")
+    if not isinstance(examples, list) or not examples:
+        return ""
+
+    selected = [ex for ex in examples[-limit:] if isinstance(ex, dict) and ex.get("approved_dm")]
+    if not selected:
+        return ""
+
+    lines: list[str] = [
+        "Usa como referencia de estilo, tono, cercanía y estructura estos mensajes DM aprobados/editados por Manuel:"
+    ]
+    for idx, ex in enumerate(selected, start=1):
+        title = str(ex.get("post_title", "")).strip() or "Publicación"
+        kw = str(ex.get("keyword", "")).strip()
+        approved_dm = str(ex.get("approved_dm", "")).strip()
+        notes = ex.get("feedback_notes") or []
+        header = f"{idx}. Post '{title}'" + (f" (Palabra clave: {kw})" if kw else "")
+        lines.append(header)
+        if notes:
+            lines.append(f"   Preferencia indicada por Manuel: {'; '.join(str(n) for n in notes)}")
+        lines.append(f"   DM preferido por Manuel:\n   {approved_dm}")
+    return "\n".join(lines)
 
 
 def get_published_media(
@@ -1874,6 +1999,8 @@ def format_guideline_entry_lines(
     has_keyword_cta: bool = False,
     keyword: str = "",
     target_link: str = "",
+    dm_message: str = "",
+    public_reply_text: str = "",
     is_story: bool = False,
 ) -> list[str]:
     """Format an approved proposal into the exact multi-line structure used in `Pautas`."""
@@ -1931,6 +2058,15 @@ def format_guideline_entry_lines(
         if target_link.strip():
             dm_detail += f" -> {target_link.strip()}"
         lines.append(f"DM automático: {dm_detail}")
+        if public_reply_text.strip():
+            lines.append(f"Respuesta pública: {public_reply_text.strip()}")
+        if dm_message.strip():
+            dm_lines = [ln.rstrip() for ln in dm_message.strip().splitlines()]
+            if len(dm_lines) == 1:
+                lines.append(f"Mensaje DM: {dm_lines[0]}")
+            else:
+                lines.append("Mensaje DM:")
+                lines.extend(dm_lines)
     return lines
 
 
@@ -2211,6 +2347,8 @@ class GuidelineEntry:
     keyword: str
     target_link: str
     raw_block: str
+    dm_message: str = ""
+    public_reply_text: str = ""
     is_marked_published: bool = False
 
 
@@ -2234,6 +2372,8 @@ _ENTRY_BOLD_PREFIXES = (
     "Nota / Comentario:",
     "Hashtags:",
     "DM automático:",
+    "Respuesta pública:",
+    "Mensaje DM:",
 )
 
 
@@ -2368,37 +2508,49 @@ def parse_guidelines_entries(
         hook_title = ""
         hashtags = ""
         dm_raw = ""
+        public_reply_text = ""
+        dm_message_lines: list[str] = []
         caption_lines: list[str] = []
-        in_caption = False
+        active_multiline: str = ""
 
         for raw in block_lines[1:]:
             s = raw.strip()
             lower_s = _normalize_match_text(s)
             if lower_s.startswith("fecha:"):
-                in_caption = False
+                active_multiline = ""
                 fecha_raw = s.split(":", 1)[1].strip()
             elif lower_s.startswith("horario:"):
-                in_caption = False
+                active_multiline = ""
                 horario_raw = s.split(":", 1)[1].strip()
             elif lower_s.startswith("pauta en meta ads:"):
-                in_caption = False
+                active_multiline = ""
                 ads_raw = s.split(":", 1)[1].strip()
             elif lower_s.startswith("titulo / gancho:") or lower_s.startswith("titulo/gancho:"):
-                in_caption = False
+                active_multiline = ""
                 hook_title = s.split(":", 1)[1].strip()
             elif lower_s.startswith("caption:") or lower_s.startswith("nota / comentario:") or lower_s.startswith("nota/comentario:"):
-                in_caption = True
+                active_multiline = "caption"
                 rest = s.split(":", 1)[1].strip()
                 if rest:
                     caption_lines.append(rest)
             elif lower_s.startswith("hashtags:"):
-                in_caption = False
+                active_multiline = ""
                 hashtags = s.split(":", 1)[1].strip()
             elif lower_s.startswith("dm automatico:") or lower_s.startswith("dm automático:"):
-                in_caption = False
+                active_multiline = ""
                 dm_raw = s.split(":", 1)[1].strip()
-            elif in_caption:
+            elif lower_s.startswith("respuesta publica:") or lower_s.startswith("respuesta pública:"):
+                active_multiline = ""
+                public_reply_text = s.split(":", 1)[1].strip()
+            elif lower_s.startswith("mensaje dm:"):
+                active_multiline = "dm_message"
+                rest = s.split(":", 1)[1].strip()
+                if rest:
+                    dm_message_lines.append(rest)
+            elif active_multiline == "caption":
                 caption_lines.append(raw.rstrip())
+            elif active_multiline == "dm_message":
+                dm_message_lines.append(raw.rstrip())
 
         scheduled_dt = _parse_fecha_horario(fecha_raw, horario_raw, default_tz=default_tz)
         promote, budget, days = _parse_ads_field(ads_raw)
@@ -2423,6 +2575,8 @@ def parse_guidelines_entries(
                 keyword=keyword,
                 target_link=target_link,
                 raw_block="\n".join(block_lines).strip(),
+                dm_message="\n".join(dm_message_lines).strip(),
+                public_reply_text=public_reply_text,
                 is_marked_published=bool(_PUBLISHED_HEADER_TAG_RE.search(header)),
             )
         )
@@ -3564,3 +3718,329 @@ def collect_previous_weekly_reports(
         logger.warning("No se pudieron leer informes semanales previos: %s", exc)
 
     return collected
+
+
+@dataclass(frozen=True, slots=True)
+class ResourceSyncResult:
+    """Result of scanning the `Guías PDF y recursos` Google Drive folder."""
+
+    folder_id: str
+    folder_name: str
+    folder_created: bool
+    newly_added: list[dict[str, Any]]
+    total_resources: int
+
+
+def resolve_resources_folder(
+    *,
+    root_folder_id: str,
+    resources_folder_id: str = "",
+    resources_folder_name: str = "Guías PDF y recursos",
+    credentials_path: Path | str | None = None,
+    create_if_missing: bool = True,
+) -> tuple[str | None, str, bool]:
+    """Resolve the dedicated PDF/resources Drive folder (explicit ID or subfolder inside root)."""
+    clean_id = resources_folder_id.strip()
+    clean_name = resources_folder_name.strip() or "Guías PDF y recursos"
+    try:
+        creds_path = _resolve_credentials_path(credentials_path)
+        service = _get_drive_client(creds_path)
+
+        if clean_id:
+            try:
+                meta = _execute_with_retry(
+                    service.files().get(
+                        fileId=clean_id,
+                        fields="id, name, mimeType, trashed",
+                        supportsAllDrives=True,
+                    ),
+                    f"get_resources_folder({clean_id})",
+                )
+                if meta.get("trashed"):
+                    raise DriveServiceError(
+                        f"La carpeta DRIVE_RESOURCES_FOLDER_ID={clean_id} está en la papelera de Google Drive."
+                    )
+                return str(meta["id"]), str(meta.get("name", clean_name)), False
+            except HttpError as exc:
+                if exc.resp.status in {403, 404}:
+                    sa_email = _get_service_account_email(creds_path)
+                    email_hint = f" con '{sa_email}'" if sa_email else ""
+                    raise DriveServiceError(
+                        f"No se puede acceder a DRIVE_RESOURCES_FOLDER_ID={clean_id} "
+                        f"(HTTP {exc.resp.status}). Verifica el ID y que esté compartida{email_hint}."
+                    ) from exc
+                raise
+
+        norm_target = _normalize_match_text(clean_name)
+        q = (
+            f"'{root_folder_id}' in parents "
+            f"and mimeType = '{GOOGLE_FOLDER_MIME_TYPE}' "
+            "and trashed = false"
+        )
+        resp = _execute_with_retry(
+            service.files().list(
+                q=q,
+                spaces="drive",
+                corpora="allDrives",
+                fields="files(id, name)",
+                pageSize=100,
+                supportsAllDrives=True,
+                includeItemsFromAllDrives=True,
+            ),
+            f"find_resources_folder({root_folder_id})",
+        )
+        for item in resp.get("files", []):
+            fname = str(item.get("name", "")).strip()
+            if _normalize_match_text(fname) == norm_target:
+                return str(item["id"]), fname, False
+
+        if not create_if_missing:
+            return None, clean_name, False
+
+        created_id = _create_subfolder(service, root_folder_id, clean_name)
+        logger.info("Carpeta de recursos '%s' creada en Drive (%s).", clean_name, created_id)
+        return created_id, clean_name, True
+    except HttpError as exc:
+        raise DriveServiceError(
+            f"Error resolviendo carpeta de recursos '{clean_name}': {exc}"
+        ) from exc
+
+
+def ensure_file_public_read_link(
+    file_id: str,
+    credentials_path: Path | str | None = None,
+) -> str:
+    """Ensure anyone-with-link reader access on a resource file and return its `webViewLink`."""
+    service = _get_drive_client(credentials_path)
+    try:
+        perms_resp = _execute_with_retry(
+            service.permissions().list(
+                fileId=file_id,
+                fields="permissions(id, type, role)",
+                supportsAllDrives=True,
+            ),
+            f"list_resource_permissions({file_id})",
+        )
+        has_anyone_reader = any(
+            str(p.get("type", "")).lower() == "anyone"
+            and str(p.get("role", "")).lower() in {"reader", "commenter", "writer"}
+            for p in perms_resp.get("permissions", [])
+        )
+    except HttpError:
+        has_anyone_reader = False
+
+    if not has_anyone_reader:
+        try:
+            _execute_with_retry(
+                service.permissions().create(
+                    fileId=file_id,
+                    body={"role": "reader", "type": "anyone"},
+                    fields="id",
+                    supportsAllDrives=True,
+                ),
+                f"create_resource_public_read({file_id})",
+            )
+        except HttpError as perm_exc:
+            logger.warning(
+                "No se pudo asignar permiso público de lectura al recurso %s: %s",
+                file_id,
+                perm_exc,
+            )
+
+    meta = _execute_with_retry(
+        service.files().get(
+            fileId=file_id,
+            fields="id, webViewLink",
+            supportsAllDrives=True,
+        ),
+        f"get_resource_link({file_id})",
+    )
+    view_link = str(meta.get("webViewLink", "")).strip()
+    return view_link or f"https://drive.google.com/file/d/{file_id}/view"
+
+
+def _extract_resource_preview_text(
+    service: Resource,
+    file_meta: dict[str, Any],
+    credentials_path: Path | str | None = None,
+    max_chars: int = 2500,
+) -> str:
+    """Best-effort extract readable excerpt from PDF, DOCX, Google Doc, or text resource."""
+    file_id = str(file_meta.get("id", ""))
+    mime_type = str(file_meta.get("mimeType", "")).lower()
+    lower_name = str(file_meta.get("name", "")).lower()
+
+    is_doc = mime_type == GOOGLE_DOC_MIME_TYPE
+    is_text = mime_type.startswith("text/") or lower_name.endswith((".txt", ".md"))
+    is_docx = mime_type == DOCX_MIME_TYPE or lower_name.endswith(".docx")
+    is_pdf = mime_type == PDF_MIME_TYPE or lower_name.endswith(".pdf")
+    if not (is_doc or is_text or is_docx or is_pdf):
+        return ""
+
+    try:
+        if is_doc or is_text:
+            text = get_guidelines_text(file_id, credentials_path=credentials_path)
+        else:
+            raw_bytes: bytes = _execute_with_retry(
+                service.files().get_media(fileId=file_id, supportsAllDrives=True),
+                f"download_resource_preview({file_id})",
+            )
+            text = _extract_docx_text(raw_bytes) if is_docx else _extract_pdf_text(raw_bytes)
+        clean = re.sub(r"\s+", " ", text).strip()
+        return clean[:max_chars]
+    except Exception as exc:
+        logger.debug("No se pudo extraer texto previo del recurso %s: %s", file_id, exc)
+        return ""
+
+
+def sync_resources_folder(
+    *,
+    root_folder_id: str,
+    resources_folder_id: str = "",
+    resources_folder_name: str = "Guías PDF y recursos",
+    state_path: Path | str | None = None,
+    credentials_path: Path | str | None = None,
+    create_if_missing: bool = True,
+) -> ResourceSyncResult:
+    """Scan `Guías PDF y recursos`, detect newly uploaded files, and update `state.json`."""
+    resolved_id, resolved_name, created = resolve_resources_folder(
+        root_folder_id=root_folder_id,
+        resources_folder_id=resources_folder_id,
+        resources_folder_name=resources_folder_name,
+        credentials_path=credentials_path,
+        create_if_missing=create_if_missing,
+    )
+    if not resolved_id:
+        return ResourceSyncResult(
+            folder_id="",
+            folder_name=resolved_name,
+            folder_created=False,
+            newly_added=[],
+            total_resources=0,
+        )
+
+    service = _get_drive_client(credentials_path)
+    query = (
+        f"'{resolved_id}' in parents "
+        f"and mimeType != '{GOOGLE_FOLDER_MIME_TYPE}' "
+        "and trashed = false"
+    )
+    resp = _execute_with_retry(
+        service.files().list(
+            q=query,
+            spaces="drive",
+            corpora="allDrives",
+            fields="files(id, name, mimeType, size, modifiedTime, webViewLink)",
+            orderBy="modifiedTime desc",
+            pageSize=100,
+            supportsAllDrives=True,
+            includeItemsFromAllDrives=True,
+        ),
+        f"list_resources_folder({resolved_id})",
+    )
+    drive_items = list(resp.get("files", []))
+    drive_by_id = {str(item["id"]): item for item in drive_items if item.get("id")}
+
+    path = _get_state_path(state_path)
+    newly_added: list[dict[str, Any]] = []
+
+    with _STATE_LOCK:
+        try:
+            state = _read_state_unlocked(path)
+        except DriveServiceError:
+            state = _empty_state()
+
+        recorded = dict(state.get("resource_files") or {})
+        # Remove deleted/trashed files from active catalog
+        active_recorded: dict[str, Any] = {}
+        for fid, rec in recorded.items():
+            if fid in drive_by_id and isinstance(rec, dict):
+                # Keep name/url synced if renamed
+                updated_rec = dict(rec)
+                updated_rec["name"] = str(drive_by_id[fid].get("name", rec.get("name", fid)))
+                active_recorded[fid] = updated_rec
+
+        for fid, item in drive_by_id.items():
+            if fid in active_recorded:
+                continue
+            share_url = ensure_file_public_read_link(fid, credentials_path=credentials_path)
+            preview_text = _extract_resource_preview_text(
+                service,
+                item,
+                credentials_path=credentials_path,
+            )
+            entry = {
+                "file_id": fid,
+                "name": str(item.get("name", fid)),
+                "mime_type": str(item.get("mimeType", "")),
+                "size": int(item.get("size", 0) or 0),
+                "url": share_url,
+                "preview_text": preview_text[:1500],
+                "summary": preview_text[:280] if preview_text else "",
+                "suggested_use": "",
+                "detected_at": datetime.now(timezone.utc).isoformat(),
+            }
+            active_recorded[fid] = entry
+            newly_added.append(dict(entry))
+
+        state["resource_files"] = active_recorded
+        _save_state_unlocked(state, path)
+
+    return ResourceSyncResult(
+        folder_id=resolved_id,
+        folder_name=resolved_name,
+        folder_created=created,
+        newly_added=newly_added,
+        total_resources=len(active_recorded),
+    )
+
+
+def update_resource_summary(
+    file_id: str,
+    summary: str,
+    suggested_use: str = "",
+    state_path: Path | str | None = None,
+) -> None:
+    """Update the stored summary and suggested DM usage for a synced resource file."""
+    path = _get_state_path(state_path)
+    with _STATE_LOCK:
+        try:
+            state = _read_state_unlocked(path)
+        except DriveServiceError:
+            state = _empty_state()
+        resources = dict(state.get("resource_files") or {})
+        if file_id in resources and isinstance(resources[file_id], dict):
+            resources[file_id]["summary"] = summary.strip()
+            if suggested_use.strip():
+                resources[file_id]["suggested_use"] = suggested_use.strip()
+            state["resource_files"] = resources
+            _save_state_unlocked(state, path)
+
+
+def get_resources_catalog(state_path: Path | str | None = None) -> list[dict[str, Any]]:
+    """Return active PDF/guide resources tracked in `state.json`."""
+    state = load_state(state_path)
+    raw = state.get("resource_files") or {}
+    return [dict(v) for v in raw.values() if isinstance(v, dict)]
+
+
+def format_resources_catalog_context(resources: list[dict[str, Any]], limit: int = 15) -> str:
+    """Format the Drive resources catalog for Gemini prompts."""
+    if not resources:
+        return ""
+    lines: list[str] = [
+        "Archivos disponibles en la carpeta universal 'Guías PDF y recursos' de Google Drive "
+        "(úsalos en `target_link` SOLO cuando el contenido de la pauta realmente amerite entregar ese recurso puntual):"
+    ]
+    for idx, item in enumerate(resources[:limit], start=1):
+        name = str(item.get("name", "Recurso")).strip()
+        url = str(item.get("url", "")).strip()
+        summary = str(item.get("summary", "")).strip()
+        suggested = str(item.get("suggested_use", "")).strip()
+        line = f"{idx}. {name} -> {url}"
+        if summary:
+            line += f"\n   Contenido: {summary}"
+        if suggested:
+            line += f"\n   Uso sugerido: {suggested}"
+        lines.append(line)
+    return "\n".join(lines)
